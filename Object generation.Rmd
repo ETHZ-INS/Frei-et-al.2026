@@ -1,0 +1,2175 @@
+---
+title: "Object generation"
+author: "Selina Frei"
+date: "2026-10-01"
+output: html_document
+---
+
+# loading packages
+```{r}
+library(GenomeInfoDb)
+library(rtracklayer)
+library(GenomicFeatures)
+library(GenomicRanges)
+library(BiocParallel)
+library(Biostrings)
+library(BSgenome.Mmusculus.UCSC.mm39)
+library(SummarizedExperiment)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(openxlsx)
+library(bsseq)
+library(stringr)
+library(edgeR)
+library(sechm)
+library(data.table)
+library(AnnotationHub)
+set.seed(123)
+```
+
+# RNA-Sequencing Analysis 
+```{r}
+# Load obejct and relevel conditions
+se <- readRDS("objects/CRS2025_polyA_salmon.SE.rds")
+
+# Surrogate variable correction 
+se <- SEtools::svacor(se, ~Group,n.sv = 1)
+# Differential expression analysis
+
+dds <- calcNormFactors(DGEList(assay(se))) 
+
+assays(se)$logcpm <- log1p(edgeR::cpm(dds)) 
+
+mm <- model.matrix(~0+Group+SV1, data=as.data.frame(colData(se))); mm
+
+group <- colData(se)$Group
+
+dds <- dds[filterByExpr(dds,group = group, min.count = 20), ]
+dds <- estimateDisp(dds,design = mm)
+se <- se[row.names(dds),]
+se <- log2FC(
+  se,
+  fromAssay = "corrected",
+  controls = se$Period == "morning",
+  isLog = FALSE,
+  by = se$Condition)
+#saveRDS(se,"objects/CRS2025_polyA_salmon.SE.analysed.rds")
+fit <- glmFit(dds, mm)
+
+# Create contrasts
+my.contrast <- makeContrasts(
+  PM_CRSvsCtrl = Groupevening.CRS - Groupevening.Ctrl ,
+  AM_CRSvsCtrl = Groupmorning.CRS - Groupmorning.Ctrl,
+  AMvsPM_CRS = Groupmorning.CRS - Groupevening.CRS,
+  AMvsPM_Ctrl = Groupmorning.Ctrl - Groupevening.Ctrl,
+  CRS_Period_int = ((Groupmorning.CRS - Groupmorning.Ctrl) - (Groupevening.CRS - Groupevening.Ctrl)), # interaction term
+  Total_CRSvsCtrl = (Groupmorning.CRS - Groupmorning.Ctrl + Groupevening.CRS - Groupevening.Ctrl)/2,
+  Total_AMvsPM =  (Groupmorning.Ctrl - Groupevening.Ctrl + Groupmorning.CRS - Groupevening.CRS)/2,
+  levels = mm)
+my.contrast 
+```
+
+### Staged results
+```{r}
+screen  <- as.data.frame(topTags(glmLRT(fit, contrast = my.contrast),Inf))
+se_staged <- stagedInteractionsCont(se, screen, fit)
+deas <- getDEA((se_staged))
+for (name in names(deas)){
+  deas[[name]]$ID <- gsub(x = rownames(deas[[name]]),pattern = "ENS(.*)\\.",replacement = "")
+  deas[[name]]$DEA <- name }
+deas
+
+#saveRDS(object = deas,file = "objects/DEA_CRS2025.rds")
+
+deas <- readRDS("objects/DEA_CRS2025.rds")
+```
+
+### Cycling genes in Control group
+```{r}
+ctrl_genes <- rownames(subset(deas$stage.Total_AMvsPM,FDR < 0.05))
+#saveRDS(ctrl_genes, "objects/CRS2025_Cycling_genes.rds")
+```
+
+### Npas4, Ogg1, Per2, Xrcc1 and Clock corrected levels
+```{r}
+se <- readRDS("objects/CRS2025_polyA_salmon.SE.analysed.rds")
+npas4_row <- which(grepl("\\.Clock$", rownames(se))) # change gene name here
+npas4_corrected <- assays(se)$corrected[npas4_row, ]
+npas4_df <- data.frame(
+  Condition = tolower(as.character(se$Condition)),
+  expression = as.numeric(npas4_corrected),
+  Period = se$Period)
+write.xlsx(npas4_df,"objects/Clock_expression.xlsx",rowNames = FALSE) #change name
+```
+
+
+## Diurnal amplitude calculations
+```{r}
+se <- readRDS("objects/CRS2025_polyA_salmon.SE.analysed.rds")
+deas <- readRDS("objects/DEA_CRS2025.rds")
+total_genes <- rownames(subset(deas$stage.Total_AMvsPM))
+#cycling_genes <- rownames(subset(deas$stage.Total_AMvsPM, FDR < 0.05))
+
+amp_df <- calculate_amplitudes(genes = total_genes,se = se)
+#saveRDS(amp_df, "objects/RNA_amplifications.rds")
+
+dampened_genes <- amp_df$Gene[amp_df$delta_amp > 0]
+#saveRDS(dampened_genes,"objects/CRS2025_dampened_cycling_genes.rds")
+```
+
+# OxoG in hippocampus 
+
+## OxoG around TSS 
+
+### Load object 
+```{r}
+oxi <- readRDS("objects/hippocampus_oxoG.rds")
+```
+
+### Create bins for oxoG levels around TSS
+```{r}
+ref_file <- "objects/Mus_musculus.GRCm39.112.gtf"
+ref_txdb <- txdbmaker::makeTxDbFromGFF(ref_file, format = "gtf")
+keep_chrs <- paste0("chr", c(1:19, "X", "Y"))
+gene_body <- genes(ref_txdb, columns = c("gene_id"))
+seqlevelsStyle(gene_body) <- "UCSC"
+gene_body <- keepSeqlevels(gene_body, keep_chrs, pruning.mode = "coarse")  
+
+# To be consistent with the overall-regions that we created before, we filter out those extremely short genes:
+gene_body <- gene_body[which(width(gene_body) > 50), ]  
+
+geneBodiesDt <- as.data.table(gene_body)  
+
+# get the bins around TSS
+
+# here we need to consider the strand:
+# if the gene is located on the + strand, then the start(gene) is the TSS; 
+# if the gene is located on the - strand, then the end(gene) is the TSS instead.
+# also when calculating the up/downstream part, we have to take the strand into consideration
+
+geneBodiesDt[,tss:=fifelse(strand=="+", start, end)]
+geneBodiesDt[,region_start:=tss-19.9e3]  
+geneBodiesDt[,region_end:=tss+19.9e3]
+
+bins <- lapply(1:nrow(geneBodiesDt), function(i){
+  if(geneBodiesDt$strand[i]=="-")
+  {
+    cut(geneBodiesDt$region_end[i]:geneBodiesDt$region_start[i], breaks=seq(from=geneBodiesDt$region_end[i], to=geneBodiesDt$region_start[i],
+                                                                  length.out = 199 + 1), ordered_result=TRUE, dig.lab = 10) 
+  }
+  else{
+    cut(geneBodiesDt$region_start[i]:geneBodiesDt$region_end[i], breaks=seq(from=geneBodiesDt$region_start[i], to=geneBodiesDt$region_end[i],
+                                                                  length.out = 199 + 1), ordered_result=TRUE, dig.lab = 10)
+  }
+})
+binsLevels <- lapply(bins, levels)
+binsDt <- data.table(bins=unlist(binsLevels), 
+                     chr=rep(geneBodiesDt$seqnames, each=199),
+                     strand=rep(geneBodiesDt$strand, each=199),
+                     gene_start=rep(geneBodiesDt$start, each=199),
+                     gene_end=rep(geneBodiesDt$end, each=199),
+                     gene_length=rep(geneBodiesDt$end-geneBodiesDt$start+1, each=199), 
+                     bin_counter=rep(1:199, length(bins)),
+                     gene=rep(gene_body$gene_id, each=199))
+binsDt[,c("start","end"):=tstrsplit(bins,split=",")]
+binsDt[,start:=as.integer(gsub("(", "", start, fixed=TRUE))]
+binsDt[,end:=as.integer(gsub("]", "", end, fixed=TRUE))]
+
+allBinRanges_around_TSS <- makeGRangesFromDataFrame(binsDt, keep.extra.columns=TRUE)
+allBinRanges_around_TSS <- allBinRanges_around_TSS[order(allBinRanges_around_TSS$gene), ]
+# Here we found that the start site of each bins should not be included actually in the corresponding bin. So now we remove it:
+start(allBinRanges_around_TSS) <- start(allBinRanges_around_TSS)+1
+allBinRanges_around_TSS
+
+# now we need to solve the problem of the counter number. 
+# we need to consider the strand:
+# for + strand: from 1 to 200
+# for - strand: from 200 to 1
+gr_split <- split(allBinRanges_around_TSS, allBinRanges_around_TSS$gene)
+gr_split <- lapply(gr_split, function(x){
+  x <- sort(x) 
+  if (as.character(strand(x)[1]) == "+") {
+    x$region_counter<- seq_len(199)
+  } else {
+    x$region_counter <- rev(seq_len(199))
+  }
+  x
+})
+allBinRanges_around_TSS <- unlist(GRangesList(gr_split))
+allBinRanges_around_TSS
+```
+
+### Calculate strand-specific, binned oxoG levels around TSS
+```{r}
+allBinRanges_around_TSS$oxoG_nontrans_counts <- sapply(oxi, \(x) countOverlaps(allBinRanges_around_TSS, x, ignore.strand = FALSE)) # count the oxoG that are on the Non-transcribed strand
+# 
+allBinRanges_around_TSS$oxoG_all_counts <- sapply(oxi, \(x) countOverlaps(allBinRanges_around_TSS, x, ignore.strand = TRUE))  #ignore the strand and count all the oxoG on the corresponding region
+allBinRanges_around_TSS$oxoG_trans_counts <- allBinRanges_around_TSS$oxoG_all_counts - allBinRanges_around_TSS$oxoG_nontrans_counts
+allBinRanges_around_TSS$strand_label <- as.character(strand(allBinRanges_around_TSS))
+```
+
+### Normalize for GC content + sample normalization factor
+```{r}
+genome <- BSgenome.Mmusculus.UCSC.mm39
+seq_region <- getSeq(genome, allBinRanges_around_TSS)
+region_GC <- letterFrequency(seq_region, letters = c("C","G"))
+rownames(region_GC) <- allBinRanges_around_TSS$gene
+head(region_GC)
+
+
+region_GC <- as.data.frame(region_GC)
+colnames(region_GC) <- c("nC", "nG")
+allBinRanges_around_TSS$nG <- region_GC$nG
+allBinRanges_around_TSS$nC <- region_GC$nC
+
+allBinRanges_around_TSS$oxoG_nontrans_level <- allBinRanges_around_TSS$oxoG_nontrans_counts/ifelse(allBinRanges_around_TSS$strand_label == "+", allBinRanges_around_TSS$nG, allBinRanges_around_TSS$nC)
+allBinRanges_around_TSS$oxoG_trans_level <- allBinRanges_around_TSS$oxoG_trans_counts/ifelse(allBinRanges_around_TSS$strand_label == "+", allBinRanges_around_TSS$nC, allBinRanges_around_TSS$nG)
+
+normF <- read.csv("objects/hippocampus_oxoG_normalization_factor.csv") 
+allBinRanges_around_TSS$oxoG_nontrans_level <- sweep(allBinRanges_around_TSS$oxoG_nontrans_level, 2, normF$Median, "/")
+allBinRanges_around_TSS$oxoG_nontrans_level <- allBinRanges_around_TSS$oxoG_nontrans_level*1000
+allBinRanges_around_TSS$oxoG_trans_level <- sweep(allBinRanges_around_TSS$oxoG_trans_level, 2, normF$Median, "/")
+allBinRanges_around_TSS$oxoG_trans_level <- allBinRanges_around_TSS$oxoG_trans_level*1000
+
+```
+
+### Create SE obj for all genes (irrespective of expression)
+
+```{r}
+oxi_around_TSS <- SummarizedExperiment(
+  assays = list(oxoG_trans_counts = allBinRanges_around_TSS$oxoG_trans_counts,
+                oxoG_nontrans_counts= allBinRanges_around_TSS$oxoG_nontrans_counts, 
+                oxoG_trans_level = allBinRanges_around_TSS$oxoG_trans_level,
+                oxoG_nontrans_level= allBinRanges_around_TSS$oxoG_nontrans_level),
+  rowData = list(nG = allBinRanges_around_TSS$nG, nC = allBinRanges_around_TSS$nC, strand = allBinRanges_around_TSS$strand_label,
+                 gene_length = allBinRanges_around_TSS$gene_length,gene_id = allBinRanges_around_TSS$gene, 
+                 counter = allBinRanges_around_TSS$region_counter),
+  colData = list(sampleID = colnames(allBinRanges_around_TSS$oxoG_trans_counts))
+)
+gtf <- import(ref_file)
+genes_gtf <- as.data.frame(gtf[gtf$type == "gene", ])
+symbols <- genes_gtf[genes_gtf$gene_id %in% rowData(oxi_around_TSS)$gene_id,c("gene_id", "gene_name")]
+matched_symbols <- symbols$gene_name[match(rowData(oxi_around_TSS)$gene_id, symbols$gene_id)]
+rowData(oxi_around_TSS)$gene_symbol <- matched_symbols
+oxi_around_TSS<- oxi_around_TSS[!is.na(rowData(oxi_around_TSS)$gene_symbol),]  #remove those without symbol id. kept 56539 in the end
+rownames(oxi_around_TSS) <- paste0(rowData(oxi_around_TSS)$gene_id, ".", rowData(oxi_around_TSS)$gene_symbol)
+oxi_around_TSS
+
+#saveRDS(oxi_around_TSS, "objects/oxi_around_TSS.rds")
+```
+
+### Select for genes that are expressed
+```{r}
+RNA <- readRDS("objects/CRS2025_polyA_salmon.SE.rds")
+group <- factor(RNA$Condition)
+RNA <- SEtools::svacor(RNA, ~group, n.sv = 1)  # to correct the technical issues
+design <- model.matrix(~ 0 + group + RNA$SV1)
+dge <- calcNormFactors(DGEList(assay(RNA, "counts")))
+keep <- filterByExpr(dge$counts, min.count = 20, design = design)
+RNA <- RNA[keep, ]  #15032 left
+
+ref_file <- "objects/Mus_musculus.GRCm39.112.gtf"
+ref_txdb <- txdbmaker::makeTxDbFromGFF(ref_file, format = "gtf")
+keep_chrs <- paste0("chr", c(1:19, "X", "Y"))
+gene_body <- genes(ref_txdb, columns = c("gene_id"))
+seqlevelsStyle(gene_body) <- "UCSC"
+gene_body <- keepSeqlevels(gene_body, keep_chrs, pruning.mode = "coarse")  
+
+rowData(RNA)$"whole_length" <- gene_body@ranges@width[match(sub("\\..*", "", rownames(RNA)), gene_body$gene_id)]
+RNA <- RNA[which(rowData(RNA)$"whole_length" !=0),]
+#saveRDS(RNA, "objects/ExpressedGenes.rds")
+```
+
+```{r}
+oxi_around_TSS <- readRDS("objects/oxi_around_TSS.rds")
+copy <- oxi_around_TSS
+copy <- copy[apply(assay(copy, "oxoG_trans_level"), 1, function(x) all(is.finite(x))), ]  # remove the genes that have infinite oxoG trans level
+copy <- copy[apply(assay(copy, "oxoG_nontrans_level"), 1, function(x) all(is.finite(x))), ]  # remove the genes that have infinite oxoG nontrans level
+conditions <- c("Ctrl_evening", "Ctrl_morning")
+strand_types <- c("Transcribed", "Non-transcribed")
+gene_sets <- readRDS("objects/ExpressedGenes.rds")
+all_results <- list()
+for (condition in conditions) {
+  for (strand_type in strand_types) {
+    key <- paste(condition, strand_type, sep = "_")
+    all_results[[key]] <- process_assay_data_expr(copy, strand_type, condition, gene_sets)
+  }
+}
+final_results_expressed <- create_summary_df(all_results)
+
+# saveRDS(final_results_expressed, "objects/hippocampus_oxoG_around_TSS_CTRL_results.rds")
+```
+
+```{r}
+oxi_around_TSS <- readRDS("objects/oxi_around_TSS.rds")
+copy <- oxi_around_TSS
+copy <- copy[apply(assay(copy, "oxoG_trans_level"), 1, function(x) all(is.finite(x))), ]  # remove the genes that have infinite oxoG trans level
+copy <- copy[apply(assay(copy, "oxoG_nontrans_level"), 1, function(x) all(is.finite(x))), ]  # remove the genes that have infinite oxoG nontrans level
+conditions <- c("CRS_evening", "CRS_morning")
+strand_types <- c("Transcribed", "Non-transcribed")
+gene_sets <- readRDS("objects/ExpressedGenes.rds")
+all_results <- list()
+for (condition in conditions) {
+  for (strand_type in strand_types) {
+    key <- paste(condition, strand_type, sep = "_")
+    all_results[[key]] <- process_assay_data_expr(copy, strand_type, condition, gene_sets)
+  }
+}
+final_results_expressed <- create_summary_df(all_results)
+
+# saveRDS(final_results_expressed, "objects/hippocampus_oxoG_around_TSS_CRS_results.rds")
+```
+
+## oxoG vs gene length
+
+### Binning (2% of length)
+
+```{r}
+oxi <- readRDS("objects/hippocampus_oxoG.rds")
+ref_file <- "objects/Mus_musculus.GRCm39.112.gtf"
+ref_txdb <-  txdbmaker::makeTxDbFromGFF(ref_file, format = "gtf")
+keep_chrs <- paste0("chr", c(1:19, "X", "Y"))
+gene_body <- genes(ref_txdb, columns = c("gene_id")) 
+seqlevelsStyle(gene_body) <- "UCSC"
+gene_body <- keepSeqlevels(gene_body, keep_chrs, pruning.mode = "coarse")  # Here the gene body covers the whole genome (all the normal chromosomes)
+
+gene_body <- gene_body[which(width(gene_body) > 10), ]  # keep 57022 genes
+
+# get the genebody bins
+geneBodiesDt <- as.data.table(gene_body)  # get a data table for gene body
+wDt <- data.table(w=width(gene_body)) # get a data table for gene body width
+
+bin <- lapply(1:nrow(geneBodiesDt), function(i){
+  cut(
+    geneBodiesDt$start[i]:geneBodiesDt$end[i],
+    breaks = seq(
+      from = geneBodiesDt$start[i],
+      to = geneBodiesDt$end[i],
+      length.out = 50 + 1
+    ),
+    ordered_result = TRUE,
+    dig.lab = 10
+  )
+})
+geneIds <- gene_body$gene_id
+names(bin) <- geneIds
+binLevels <- lapply(bin, levels)
+
+binDt <- data.table(
+  bins=unlist(binLevels),
+  chr=rep(geneBodiesDt$seqnames, each=50),
+  strand=rep(geneBodiesDt$strand, each=50),
+  gene_start=rep(geneBodiesDt$start, each=50),
+  gene_end=rep(geneBodiesDt$end, each=50),
+  gene_length=rep(geneBodiesDt$end-geneBodiesDt$start+1, each=50),
+  bin_counter=rep(1:50, length(bin)),
+  gene=rep(geneIds, each=50)
+)
+binDt[,c("start","end"):=tstrsplit(bins,split=",",fixed=TRUE)]
+binDt[,start:=as.integer(gsub("(", "", start, fixed=TRUE))]  # start site of each bin
+binDt[,end:=as.integer((gsub("]", "", end, fixed=TRUE)))]  # end site of each bin
+
+# get the up/downstream bins
+
+# here we need to consider the strand:
+# if the gene is located on the + strand, then the start(gene) is the TSS; 
+# if the gene is located on the - strand, then the end(gene) is the TSS instead.
+# also when calculating the up/downstream part, we have to take the strand into consideration
+
+geneBodiesDt[,tss:=fifelse(strand=="+", start, end)]
+geneBodiesDt[,margin_up:=fifelse(strand=="+", tss-5e3, tss+5e3)]
+
+geneBodiesDt[,tes:=fifelse(strand=="+", end, start)]
+geneBodiesDt[,margin_down:=fifelse(strand=="+", tes+5e3, tes-5e3)]
+
+binsUp <- lapply(1:nrow(geneBodiesDt), function(i){
+  if(geneBodiesDt$strand[i]=="-")
+  {
+    cut(geneBodiesDt$tss[i]:geneBodiesDt$margin_up[i], breaks=seq(from=geneBodiesDt$tss[i], to=geneBodiesDt$margin_up[i],
+                                                                  length.out = 25 + 1), ordered_result=TRUE, dig.lab = 10) 
+  }
+  else{
+    cut(geneBodiesDt$margin_up[i]:geneBodiesDt$tss[i], breaks=seq(from=geneBodiesDt$margin_up[i], to=geneBodiesDt$tss[i],
+                                                                  length.out = 25 + 1), ordered_result=TRUE, dig.lab = 10)
+  }
+})
+binsUpLevels <- lapply(binsUp, levels)
+binsUpDt <- data.table(bins=unlist(binsUpLevels), 
+                       chr=rep(geneBodiesDt$seqnames, each=25),
+                       strand=rep(geneBodiesDt$strand, each=25),
+                       gene_start=rep(geneBodiesDt$start, each=25),
+                       gene_end=rep(geneBodiesDt$end, each=25),
+                       gene_length=rep(geneBodiesDt$end-geneBodiesDt$start+1, each=25), 
+                       bin_counter=rep(1:25, length(bin)), #TODO: check this again
+                       gene=rep(geneIds, each=25))
+binsUpDt[,c("start","end"):=tstrsplit(bins,split=",")]
+binsUpDt[,start:=as.integer(gsub("(", "", start, fixed=TRUE))]
+binsUpDt[,end:=as.integer(gsub("]", "", end, fixed=TRUE))]
+
+binsDown <- lapply(1:nrow(geneBodiesDt), function(i){
+  if(geneBodiesDt$strand[i]=="-")
+  {
+    cut(geneBodiesDt$margin_down[i]:geneBodiesDt$tes[i], breaks=seq(from=geneBodiesDt$margin_down[i], to=geneBodiesDt$tes[i],
+                                                                  length.out = 25 + 1), ordered_result=TRUE, dig.lab = 10) 
+  }
+  else{
+    cut(geneBodiesDt$tes[i]:geneBodiesDt$margin_down[i], breaks=seq(from=geneBodiesDt$tes[i], to=geneBodiesDt$margin_down[i],
+                                                                  length.out = 25 + 1), ordered_result=TRUE, dig.lab = 10) 
+  }
+})
+binsDownLevels <- lapply(binsDown, levels)
+binsDownDt <- data.table(bins=unlist(binsDownLevels), 
+                         chr=rep(geneBodiesDt$seqnames, each=25),
+                         strand=rep(geneBodiesDt$strand, each=25),
+                         gene_start=rep(geneBodiesDt$start, each=25),
+                         gene_end=rep(geneBodiesDt$end, each=25),
+                         gene_length=rep(geneBodiesDt$end-geneBodiesDt$start+1, each=25), 
+                         bin_counter=rep(1:25, length(bin)), #TODO: check this again
+                         gene=rep(geneIds, each=25))
+binsDownDt[,c("start","end"):=tstrsplit(bins,split=",")]
+binsDownDt[,start:=as.integer(gsub("(", "", start, fixed=TRUE))]
+binsDownDt[,end:=as.integer(gsub("]", "", end, fixed=TRUE))]
+
+allBins <- list(binsUpDt, binDt, binsDownDt)
+names(allBins) <- c("upstream", "gene_body", "downstream")
+allBinsDt <- rbindlist(allBins, idcol="bin_type")
+allBinRanges <- makeGRangesFromDataFrame(as.data.frame(allBinsDt), keep.extra.columns=TRUE)
+allBinRanges <- allBinRanges[order(allBinRanges$gene), ]
+# Here we found that the start site of each bins should not be included actually in the corresponding bin. So now we remove it:
+start(allBinRanges) <- start(allBinRanges)+1
+allBinRanges
+
+gr_split <- split(allBinRanges, allBinRanges$gene)
+gr_split <- lapply(gr_split, function(x){
+  x <- sort(x) 
+  if (as.character(strand(x)[1]) == "+") {
+    x$whole_region_counter<- seq_len(100)
+  } else {
+    x$whole_region_counter <- rev(seq_len(100))
+  }
+  x
+})
+allBinRanges <- unlist(GRangesList(gr_split))
+allBinRanges
+```
+
+### Calculate oxoG in the binned regions
+```{r}
+allBinRanges$oxoG_nontrans_counts <- sapply(oxi, \(x) countOverlaps(allBinRanges, x, ignore.strand = FALSE)) # count the oxoG that are on the Non-transcribed strand
+allBinRanges$oxoG_all_counts <- sapply(oxi, \(x) countOverlaps(allBinRanges, x, ignore.strand = TRUE))  #ignore the strand and count all the oxoG on the corresponding region
+allBinRanges$oxoG_trans_counts <- allBinRanges$oxoG_all_counts - allBinRanges$oxoG_nontrans_counts
+allBinRanges$strand_label <- as.character(strand(allBinRanges))
+```
+
+### Normalize
+```{r}
+genome <- BSgenome.Mmusculus.UCSC.mm39
+seq_region <- getSeq(genome, allBinRanges)
+region_GC <- letterFrequency(seq_region, letters = c("C","G"))
+rownames(region_GC) <- allBinRanges$gene
+head(region_GC)
+
+region_GC <- as.data.frame(region_GC)
+colnames(region_GC) <- c("nC", "nG")
+allBinRanges$nG <- region_GC$nG
+allBinRanges$nC <- region_GC$nC
+
+allBinRanges$oxoG_nontrans_level <- allBinRanges$oxoG_nontrans_counts/ifelse(allBinRanges$strand_label == "+", allBinRanges$nG, allBinRanges$nC)
+allBinRanges$oxoG_trans_level <- allBinRanges$oxoG_trans_counts/ifelse(allBinRanges$strand_label == "+", allBinRanges$nC, allBinRanges$nG)
+
+normF <- read.csv("objects/hippocampus_oxoG_normalization_factor.csv")
+allBinRanges$oxoG_nontrans_level <- sweep(allBinRanges$oxoG_nontrans_level, 2, normF$Median, "/")
+allBinRanges$oxoG_nontrans_level <- allBinRanges$oxoG_nontrans_level*1000
+allBinRanges$oxoG_trans_level <- sweep(allBinRanges$oxoG_trans_level, 2, normF$Median, "/")
+allBinRanges$oxoG_trans_level <- allBinRanges$oxoG_trans_level*1000
+```
+
+### Create SE object
+
+```{r}
+hippocampus_oxoG_gene_length <- SummarizedExperiment(
+  assays = list(oxoG_trans_counts = allBinRanges$oxoG_trans_counts,
+                oxoG_nontrans_counts= allBinRanges$oxoG_nontrans_counts, 
+                oxoG_trans_level = allBinRanges$oxoG_trans_level,
+                oxoG_nontrans_level= allBinRanges$oxoG_nontrans_level),
+  rowData = list(nG = allBinRanges$nG, nC = allBinRanges$nC, strand = allBinRanges$strand_label, 
+                 gene_length = allBinRanges$gene_length,gene_id = allBinRanges$gene, pos = allBinRanges$bin_type, 
+                 counter = allBinRanges$whole_region_counter),
+  colData = list(sampleID = colnames(allBinRanges$oxoG_trans_counts)))
+gtf <- import(ref_file)
+genes_gtf <- as.data.frame(gtf[gtf$type == "gene", ])
+symbols <- genes_gtf[genes_gtf$gene_id %in% rowData(hippocampus_oxoG_gene_length )$gene_id,c("gene_id", "gene_name")]
+matched_symbols <- symbols$gene_name[match(rowData(hippocampus_oxoG_gene_length )$gene_id, symbols$gene_id)]
+rowData(hippocampus_oxoG_gene_length )$gene_symbol <- matched_symbols
+hippocampus_oxoG_gene_length  <- hippocampus_oxoG_gene_length [!is.na(rowData(hippocampus_oxoG_gene_length )$gene_symbol),]  #remove those without symbol id. kept 56539 in the end
+rownames(hippocampus_oxoG_gene_length ) <- paste0(rowData(hippocampus_oxoG_gene_length )$gene_id, ".", rowData(hippocampus_oxoG_gene_length )$gene_symbol)
+#saveRDS(hippocampus_oxoG_gene_length, "objects/hippocampus_oxoG_gene_length.rds")
+```
+
+### annotate for plotting
+```{r}
+oxi_whole_interest_region <- readRDS("objects/hippocampus_oxoG_gene_length.rds")
+copy <- oxi_whole_interest_region
+copy <- copy[apply(assay(copy, "oxoG_trans_level"), 1, function(x) all(is.finite(x))), ]  # remove the genes that have infinite oxoG trans level
+copy <- copy[apply(assay(copy, "oxoG_nontrans_level"), 1, function(x) all(is.finite(x))), ]  # remove the genes that have infinite oxoG nontrans level
+quantile(rowData(copy)$gene_length, probs = seq(0, 1, 0.05))
+rowData(copy)$gene_length_label <- ifelse(
+  rowData(copy)$gene_length < 9000, "<9Kb", ifelse(
+    rowData(copy)$gene_length < 23000, "<23Kb", ifelse(
+      rowData(copy)$gene_length < 60000, "<60Kb", ">=60Kb")))
+
+expressed <- readRDS("objects/ExpressedGenes.rds")
+
+# CTRL group
+conditions <- c("Ctrl_evening", "Ctrl_morning")
+ctrl_results <- list()
+for (condition in conditions) {
+key <- condition
+
+ctrl_results[[key]] <- process_assay_data(
+oxi_obj = copy,
+condition = condition,
+gene_set = expressed)
+}
+
+ctrl_results <- bind_rows(ctrl_results) %>%
+  group_by(counter, strand, gene_length_label) %>%
+  summarise(oxoG = mean(oxoG),se_val = mean(se_val),.groups = "drop")
+
+saveRDS(ctrl_results, "objects/hippocampus_oxoG_gene_length_CTRL.rds")
+
+# CRS group
+conditions <- c("CRS_evening", "CRS_morning")
+crs_results <- list()
+for (condition in conditions) {
+key <- condition
+
+crs_results[[key]] <- process_assay_data(
+oxi_obj = copy,
+condition = condition,
+gene_set = expressed)
+}
+
+crs_results <- bind_rows(crs_results) %>%
+  group_by(counter, strand, gene_length_label) %>%
+  summarise(oxoG = mean(oxoG),se_val = mean(se_val),.groups = "drop")
+
+saveRDS(ctrl_results, "objects/hippocampus_oxoG_gene_length_CRS.rds")
+```
+
+## Dinucleotide analysis in hippocampus (genome-wide)
+
+```{r}
+oxi <- readRDS("objects/hippocampus_oxoG.rds")
+genome <- BSgenome.Mmusculus.UCSC.mm39
+seqs <- getSeq(genome)
+seqs <- seqs[names(seqs) %in% c(paste0("chr", 1:19), "chrX", "chrY"),]
+
+# # ========================== for ApGs ==========================
+ ApG_gr <- get_dinuc_granges(seq = seqs, dinuc = "AG")
+ gc()
+ ag_tmp <- lapply(oxi, \(x) as(countOverlaps(ApG_gr, x, ignore.strand = FALSE), "sparseVector"))
+ ApG_gr$oxoG_counts <- do.call(cbind, lapply(ag_tmp, function(v) as(v, "CsparseMatrix")))
+ colnames(ApG_gr$oxoG_counts) <- names(oxi)
+ gc()
+ rm(ag_tmp)
+
+ normF <- read.csv("objects/hippocampus_normalization_factors.csv")
+
+normF$Sample <- gsub("^Sample_|_S[0-9]+$", "", normF$Sample)
+
+normF <- normF[match(names(oxi), normF$Sample),]
+
+ ApG_gr$oxoG_level <- t(t(ApG_gr$oxoG_counts)*1000/normF$Median)
+ colnames(ApG_gr$oxoG_level) <- names(oxi)
+  saveRDS(ApG_gr, "objects/hippocampus_oxoG_ApG.rds")
+ gc()
+ rm(ApG_gr)
+# # ========================== for TpGs ==========================
+ TpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "TG")
+ gc()
+ tg_tmp <- lapply(oxi, \(x) as(countOverlaps(TpG_gr, x, ignore.strand = FALSE), "sparseVector"))
+ TpG_gr$oxoG_counts <- do.call(cbind, lapply(tg_tmp, function(v) as(v, "CsparseMatrix")))
+ colnames(TpG_gr$oxoG_counts) <- names(oxi)
+ gc()
+ rm(tg_tmp)
+ TpG_gr$oxoG_level <- t(t(TpG_gr$oxoG_counts)*1000/normF$Median)
+ colnames(TpG_gr$oxoG_level) <- names(oxi)
+  saveRDS(TpG_gr, "objects/hippocampus_oxoG_TpG.rds")
+ gc()
+ rm(TpG_gr)
+# # ========================== for CpGs ==========================
+ CpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "CG")
+ gc()
+ cg_tmp <- lapply(oxi, \(x) as(countOverlaps(CpG_gr, x, ignore.strand = FALSE), "sparseVector"))
+ CpG_gr$oxoG_counts <- do.call(cbind, lapply(cg_tmp, function(v) as(v, "CsparseMatrix")))
+colnames(CpG_gr$oxoG_counts) <- names(oxi)
+ gc()
+ rm(cg_tmp)
+ CpG_gr$oxoG_level <- t(t(CpG_gr$oxoG_counts)*1000/normF$Median)
+ colnames(CpG_gr$oxoG_level) <- names(oxi)
+  saveRDS(CpG_gr, "objects/hippocampus_oxoG_CpG.rds")
+ gc()
+ rm(CpG_gr)
+# # ========================== for GpGs ==========================
+ GpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "GG")
+ gc()
+ gg_tmp <- lapply(oxi, \(x) as(countOverlaps(GpG_gr, x, ignore.strand = FALSE), "sparseVector"))
+ GpG_gr$oxoG_counts <- do.call(cbind, lapply(gg_tmp, function(v) as(v, "CsparseMatrix")))
+colnames(GpG_gr$oxoG_counts) <- names(oxi)
+ gc()
+ rm(gg_tmp)
+ GpG_gr$oxoG_level <- t(t(GpG_gr$oxoG_counts)*1000/normF$Median)
+ colnames(GpG_gr$oxoG_level) <- names(oxi)
+  saveRDS(GpG_gr, "objects/hippocampus_oxoG_GpG.rds")
+ gc()
+ rm(GpG_gr)
+ 
+ApG_gr <- readRDS("objects/hippocampus_oxoG_ApG.rds")
+TpG_gr <- readRDS("objects/hippocampus_oxoG_TpG.rds")
+CpG_gr <- readRDS("objects/hippocampus_oxoG_CpG.rds")
+GpG_gr <- readRDS("objects/hippocampus_oxoG_GpG.rds")
+gc()
+
+dinuc <- data.frame(
+  ApG = sapply(
+    seq_len(ncol(ApG_gr$oxoG_level)),
+    \(i) mean(ApG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001) #For the old data, I removed the trimming!!!!!
+  ),
+  TpG = sapply(
+    seq_len(ncol(TpG_gr$oxoG_level)),
+    \(i) mean(TpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)
+  ),
+  CpG = sapply(
+    seq_len(ncol(CpG_gr$oxoG_level)),
+    \(i) mean(CpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)
+  ),
+ GpG = sapply(
+   seq_len(ncol(GpG_gr$oxoG_level)),
+   \(i) mean(GpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)
+  ),
+  sample = colnames(ApG_gr$oxoG_level)
+)
+
+dinuc$Treatment <- sub("^[0-9]+_", "", dinuc$sample)
+
+saveRDS(dinuc, "objects/hippocampus_dinuc_summary.rds")
+```
+
+## Dinucleotide analysis in hippocampus (satellite regions)
+```{r}
+ah <- AnnotationHub()
+query(ah, c("Mus musculus", "mm39", "RepeatMasker"))
+query(ah, c("mm39", "RepeatMasker"))
+rmsk <- ah[["AH99013"]]
+major_satellite <- rmsk[rmsk$repName == "GSAT_MM"]
+major_satellite <- reduce(major_satellite)
+
+oxi <- readRDS("objects/hippocampus_oxoG.rds")
+
+sapply(oxi, function(x)
+  length(subsetByOverlaps(x, major_satellite)))
+
+oxi_sat <- lapply(
+  oxi,
+  function(x)
+    subsetByOverlaps(x, major_satellite, ignore.strand = FALSE))
+
+saveRDS(oxi_sat, "objects/hippocampus_oxoG_satellite.rds")
+
+genome <- BSgenome.Mmusculus.UCSC.mm39
+seqs <- getSeq(genome)
+seqs <- seqs[names(seqs) %in% c(paste0("chr", 1:19), "chrX", "chrY")]
+
+# ========================== for ApGs ==========================
+
+ApG_gr <- get_dinuc_granges(seq = seqs, dinuc = "AG")
+ApG_gr <- subsetByOverlaps(ApG_gr, major_satellite)
+gc()
+ag_tmp <- lapply(
+  oxi_sat,
+  \(x) as(
+    countOverlaps(
+      ApG_gr,
+      x,
+      ignore.strand = FALSE), "sparseVector"))
+
+ApG_gr$oxoG_counts <- do.call(
+  cbind,
+  lapply(ag_tmp, function(v) as(v, "CsparseMatrix")))
+colnames(ApG_gr$oxoG_counts) <- names(oxi_sat)
+gc()
+rm(ag_tmp)
+
+normF <- read.csv("objects/hippocampus_oxoG_normalization_factor.csv")
+normF$Sample <- gsub("^Sample_|_S[0-9]+$","", normF$Sample)
+normF <- normF[match(names(oxi_sat), normF$Sample),]
+
+ApG_gr$oxoG_level <- t(t(ApG_gr$oxoG_counts) * 10 / normF$Median)
+
+colnames(ApG_gr$oxoG_level) <- names(oxi_sat)
+
+saveRDS(ApG_gr,"objects/hippocampus_oxoG_ApG_satellite.rds")
+gc()
+rm(ApG_gr)
+
+# ========================== for TpGs ==========================
+
+TpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "TG")
+TpG_gr <- subsetByOverlaps(TpG_gr, major_satellite)
+gc()
+tg_tmp <- lapply(
+  oxi_sat,
+  \(x) as(
+    countOverlaps(
+      TpG_gr,
+      x,
+      ignore.strand = FALSE
+    ),"sparseVector"))
+
+TpG_gr$oxoG_counts <- do.call(cbind, lapply(tg_tmp, function(v) as(v, "CsparseMatrix")))
+
+colnames(TpG_gr$oxoG_counts) <- names(oxi_sat)
+gc()
+rm(tg_tmp)
+
+TpG_gr$oxoG_level <- t(t(TpG_gr$oxoG_counts) * 10 / normF$Median)
+colnames(TpG_gr$oxoG_level) <- names(oxi_sat)
+saveRDS(TpG_gr,"objects/hippocampus_oxoG_TpG_satellite.rds")
+gc()
+rm(TpG_gr)
+
+# ========================== for CpGs ==========================
+
+CpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "CG")
+CpG_gr <- subsetByOverlaps(CpG_gr, major_satellite)
+gc()
+cg_tmp <- lapply(
+  oxi_sat,
+  \(x) as(
+    countOverlaps(
+      CpG_gr,
+      x,
+      ignore.strand = FALSE
+    ),"sparseVector"))
+
+CpG_gr$oxoG_counts <- do.call(cbind,lapply(cg_tmp, function(v) as(v, "CsparseMatrix")))
+
+colnames(CpG_gr$oxoG_counts) <- names(oxi_sat)
+gc()
+rm(cg_tmp)
+
+CpG_gr$oxoG_level <- t(t(CpG_gr$oxoG_counts) * 10 / normF$Median)
+colnames(CpG_gr$oxoG_level) <- names(oxi_sat)
+saveRDS(CpG_gr,"objects/hippocampus_oxoG_CpG_satellite.rds")
+gc()
+rm(CpG_gr)
+
+# ========================== for GpGs ==========================
+
+GpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "GG")
+GpG_gr <- subsetByOverlaps(GpG_gr, major_satellite)
+gc()
+gg_tmp <- lapply(
+  oxi_sat,
+  \(x) as(
+    countOverlaps(
+      GpG_gr,
+      x,
+      ignore.strand = FALSE),"sparseVector"))
+
+GpG_gr$oxoG_counts <- do.call(cbind, lapply(gg_tmp, function(v) as(v, "CsparseMatrix")))
+
+colnames(GpG_gr$oxoG_counts) <- names(oxi_sat)
+gc()
+rm(gg_tmp)
+
+GpG_gr$oxoG_level <- t(t(GpG_gr$oxoG_counts) * 10 / normF$Median)
+colnames(GpG_gr$oxoG_level) <- names(oxi_sat)
+saveRDS(GpG_gr,"objects/hippocampus_oxoG_GpG_satellite.rds")
+gc()
+rm(GpG_gr)
+
+ApG_gr <- readRDS("objects/hippocampus_oxoG_ApG_satellite.rds")
+TpG_gr <- readRDS("objects/hippocampus_oxoG_TpG_satellite.rds")
+CpG_gr <- readRDS("objects/hippocampus_oxoG_CpG_satellite.rds")
+GpG_gr <- readRDS("objects/hippocampus_oxoG_GpG_satellite.rds")
+gc()
+
+dinuc <- data.frame(
+   ApG = sapply(seq_len(ncol(ApG_gr$oxoG_level)), \(i) {mean(ApG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}), #For the old data, I removed the trimming!!!!!
+  TpG = sapply(seq_len(ncol(TpG_gr$oxoG_level)), \(i) {mean(TpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+  CpG = sapply(seq_len(ncol(CpG_gr$oxoG_level)), \(i) {mean(CpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+ GpG = sapply(seq_len(ncol(ApG_gr$oxoG_level)), \(i) {mean(GpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+  sample = colnames(GpG_gr$oxoG_level))
+
+dinuc$Treatment <- sub("^[0-9]+_", "",dinuc$sample)
+
+saveRDS(dinuc, "objects/hippocampus_dinuc_summary_satellite.rds")
+```
+
+
+## Promoter analysis 
+
+### Object generation
+```{r}
+raw_filtered <- readRDS("objects/hippocampus_oxoG.rds")  #filtered raw data
+ref_file <- "objects/Mus_musculus.GRCm39.112.gtf"
+ref_txdb <- txdbmaker::makeTxDbFromGFF(ref_file, format = "gtf")
+pc_gene <- read.table("objects/protein_coding_genelist.txt", sep = ",")
+pc_gene <- pc_gene[pc_gene[,5]!="",]
+genome <- BSgenome.Mmusculus.UCSC.mm39
+normF <- read.csv("objects/hippocampus_oxoG_normalization_factor.csv")
+TSS <- transcripts(ref_txdb, columns = c("tx_name", "gene_id"))
+promoter <- promoters(TSS, upstream = 2000, downstream = 2000)
+promoter <- promoter[!duplicated(promoter)] #remove the duplicated promoter
+seqlevelsStyle(promoter) <- "UCSC"
+keep_chrs <- paste0("chr", c(1:19, "X", "Y"))
+promoter <- keepSeqlevels(promoter, keep_chrs, pruning.mode = "coarse")
+
+seq_promoter <- getSeq(genome, promoter)
+promoter_GC <- letterFrequency(seq_promoter, letters = c("C","G"))
+rownames(promoter_GC) <- unlist(promoter$gene_id)
+head(promoter_GC)
+promoter_GC <- as.data.frame(promoter_GC)
+colnames(promoter_GC) <- c("nC", "nG")
+promoter$nG <- promoter_GC$nG
+promoter$nC <- promoter_GC$nC
+promoter$oxoG_nontrans_counts <- sapply(raw_filtered, \(x) countOverlaps(promoter, x, ignore.strand = FALSE)) # count the oxoG that are on the Non-transcribed strand
+promoter$oxoG_all_counts <- sapply(raw_filtered, \(x) countOverlaps(promoter, x, ignore.strand = TRUE))  #ignore the strand and count all the oxoG on the corresponding region
+promoter$oxoG_trans_counts <- promoter$oxoG_all_counts - promoter$oxoG_nontrans_counts
+promoter$strand_label <- as.character(strand(promoter))
+
+promoter$oxoG_nontrans_level <- promoter$oxoG_nontrans_counts/ifelse(promoter$strand_label == "+", promoter$nG, promoter$nC)
+promoter$oxoG_trans_level <- promoter$oxoG_trans_counts/ifelse(promoter$strand_label == "+", promoter$nC, promoter$nG)
+promoter$oxoG_all_level <- promoter$oxoG_all_counts / (promoter$nG + promoter$nC)
+
+#normalize across sample by normF
+promoter$oxoG_nontrans_level <- sweep(promoter$oxoG_nontrans_level, 2, normF$Median, "/")
+promoter$oxoG_nontrans_level <- promoter$oxoG_nontrans_level*1000
+promoter$oxoG_trans_level <- sweep(promoter$oxoG_trans_level, 2, normF$Median, "/")
+promoter$oxoG_trans_level <- promoter$oxoG_trans_level*1000
+promoter$oxoG_all_level <- sweep(promoter$oxoG_all_level, 2, normF$Median, "/")
+promoter$oxoG_all_level <- promoter$oxoG_all_level*1000
+
+#Create SE
+oxi_promoter_filtered <- SummarizedExperiment(
+  assays = list(oxoG_trans_counts = promoter$oxoG_trans_counts,
+                oxoG_nontrans_counts= promoter$oxoG_nontrans_counts, 
+                oxoG_all_counts= promoter$oxoG_all_counts,
+                oxoG_trans_level = promoter$oxoG_trans_level,
+                oxoG_nontrans_level= promoter$oxoG_nontrans_level,
+                 oxoG_all_level= promoter$oxoG_all_level),
+  rowData = list(nG = promoter$nG, nC = promoter$nC, strand = promoter$strand_label),
+  colData = list(sampleID = colnames(promoter$oxoG_trans_counts),
+                  condition = sapply(strsplit(colnames(promoter$oxoG_trans_counts), "_"), function(x) x[2]),period = sapply(strsplit(colnames(promoter$oxoG_trans_counts), "_"), function(x) x[3])))
+
+rownames(oxi_promoter_filtered) <- unlist(promoter$gene_id)
+rowData(oxi_promoter_filtered)$gene_id <- rownames(oxi_promoter_filtered)
+oxi_promoter_filtered
+# need to adjust the rownames of promoter object
+gtf <- import(ref_file)
+genes_gtf <- as.data.frame(gtf[gtf$type == "gene", ])
+symbols <- genes_gtf[genes_gtf$gene_id %in% rownames(oxi_promoter_filtered),c("gene_id", "gene_name")]
+matched_symbols <- symbols$gene_name[match(rownames(oxi_promoter_filtered), symbols$gene_id)]
+rowData(oxi_promoter_filtered)$gene_symbol <- matched_symbols
+oxi_promoter_filtered <- oxi_promoter_filtered[!is.na(rowData(oxi_promoter_filtered)$gene_symbol),]  
+rownames(oxi_promoter_filtered) <- paste0(rowData(oxi_promoter_filtered)$gene_id, ".", rowData(oxi_promoter_filtered)$gene_symbol)
+
+oxoG_promoter_filtered_pcgenes <- oxi_promoter_filtered[sub("\\..*", "", rownames(oxi_promoter_filtered)) %in% pc_gene[,1], ]
+# saveRDS(oxoG_promoter_filtered_pcgenes, "objects/hippocampus_oxoG_promoter_protein_coding.rds")
+#saveRDS(oxi_promoter_filtered, "objects/hippocampus_oxoG_promoter.rds")
+
+```
+
+### Differential analysis of promoter 
+```{r}
+oxi_promoter <- readRDS("objects/hippocampus_oxoG_promoter.rds")
+normF <- read.csv("objects/hippocampus_oxoG_normalization_factor.csv")
+normF$Sample <- sub("^Sample_", "", normF$Sample)
+normF$Sample <- sub("_S[0-9]+$", "", normF$Sample)
+rownames(normF) <- normF$Sample
+
+condition <- oxi_promoter$condition
+condition <- factor(condition, levels = c("Ctrl", "CRS"))
+period <- oxi_promoter$period
+period <- factor(period, levels = c("evening", "morning"))
+group <- paste(condition, period, sep="_")
+group <- factor(group, levels = c("Ctrl_evening", "Ctrl_morning", "CRS_evening", "CRS_morning"))
+design_oxoG <- model.matrix(~0+group)
+colnames(design_oxoG) <- levels(group)
+design_oxoG
+contrast <- limma::makeContrasts(Morning_CRS_vs_Ctrl = CRS_morning - Ctrl_morning,
+                                 Evening_CRS_vs_Ctrl = CRS_evening - Ctrl_evening,
+                                 Ctrl_Morning_vs_Evening = Ctrl_morning - Ctrl_evening,
+                                 CRS_Morning_vs_Evening = CRS_morning - CRS_evening,
+                                 Morning_vs_Evening =  (CRS_morning + Ctrl_morning) / 2 - (CRS_evening + Ctrl_evening) / 2, 
+                                 CRS_vs_Ctrl = (CRS_morning + CRS_evening) / 2 - (Ctrl_morning + Ctrl_evening) / 2,
+                                 Diff = (CRS_morning - CRS_evening) - (Ctrl_morning - Ctrl_evening), 
+                                 levels = design_oxoG)
+contrast
+
+
+dge_promoter_trans <- DGEList(assay(oxi_promoter, "oxoG_trans_counts")) 
+dge_promoter_trans$samples$lib.size <- median(dge_promoter_trans$samples$lib.size) 
+
+dge_promoter_trans$samples$norm.factors <- normF[colnames(dge_promoter_trans),"Median"]
+y_promoter_trans <- estimateDisp(dge_promoter_trans, design_oxoG)
+fit_promoter_trans <- glmFit(y_promoter_trans, design_oxoG)
+lrt_promoter_trans <- glmLRT(fit_promoter_trans, contrast = contrast)
+results_promoter_trans <- topTags(lrt_promoter_trans, n = Inf)
+
+# run the DEA for each contrast group
+oxi_promoter <- Reduce(function(curr_se, nm) getDEA(fit_promoter_trans, contrast, nm, curr_se, "trans"),
+             colnames(contrast),
+             init = oxi_promoter)
+
+
+rowData(oxi_promoter)$FDR_trans <- results_promoter_trans$table[rownames(oxi_promoter), "FDR"]
+oxi_promoter$norm.factor_trans <- dge_promoter_trans$samples$norm.factors
+oxi_promoter$condition <- factor(oxi_promoter$condition,levels = c("Ctrl", "CRS"))
+oxi_promoter$period <- factor(oxi_promoter$period,levels = c("evening", "morning"))
+
+oxi_promoter$group <- factor(
+  paste(oxi_promoter$condition, oxi_promoter$period, sep = "_"),
+  levels = c(
+    "Ctrl_morning",
+    "Ctrl_evening",
+    "CRS_morning",
+    "CRS_evening"))
+#saveRDS(oxi_promoter, "objects/hippocampus_oxoG_promoter_analysed.rds")
+```
+
+### Npas4 Promoter oxoG
+```{r}
+oxi_promoter <- readRDS("objects/hippocampus_oxoG_promoter_analysed.rds")
+Npas4_row <- which(rowData(oxi_promoter)$gene_symbol == "Npas4")
+Npas4_oxoG_pro <- assay(oxi_promoter, "oxoG_all_level")[Npas4_row, ]
+Npas4_mean <- colMeans(Npas4_oxoG_pro, na.rm = TRUE)
+npas4_oxoG_df <- data.frame(
+  Condition = tolower(as.character(oxi_promoter$condition)),
+  oxoG = Npas4_mean,
+  Period = tolower(as.character(oxi_promoter$period)))
+#write.xlsx(npas4_oxoG_df, file = "objects/Npas4_oxoG.xlsx",rowNames = FALSE)
+```
+
+
+## Genebody
+### Object generation
+```{r}
+raw_filtered <- readRDS("objects/hippocampus_oxoG.rds")  #filtered raw data
+ref_file <- "objects/Mus_musculus.GRCm39.112.gtf"
+ref_txdb <- txdbmaker::makeTxDbFromGFF(ref_file, format = "gtf")
+pc_gene <- read.table("objects/protein_coding_genelist.txt", sep = ",")
+pc_gene <- pc_gene[pc_gene[,5]!="",]
+genome <- BSgenome.Mmusculus.UCSC.mm39
+normF <- read.csv("objects/hippocampus_oxoG_normalization_factor.csv")
+gene_body <- genes(ref_txdb, columns = c("gene_id")) 
+seqlevelsStyle(gene_body) <- "UCSC"
+keep_chrs <- paste0("chr", c(1:19, "X", "Y"))
+gene_body <- keepSeqlevels(gene_body, keep_chrs, pruning.mode = "coarse")
+
+seq_gene_body <- getSeq(genome, gene_body)
+gene_body_GC <- letterFrequency(seq_gene_body, letters = c("C","G"))
+rownames(gene_body_GC) <- unlist(gene_body$gene_id)
+gene_body_GC <- as.data.frame(gene_body_GC)
+
+
+colnames(gene_body_GC) <- c("nC", "nG")
+gene_body$nG <- gene_body_GC$nG
+gene_body$nC <- gene_body_GC$nC
+gene_body$oxoG_nontrans_counts <- sapply(raw_filtered, \(x) countOverlaps(gene_body, x, ignore.strand = FALSE)) # count the oxoG that are on the Non-transcribed strand
+gene_body$oxoG_all_counts <- sapply(raw_filtered, \(x) countOverlaps(gene_body, x, ignore.strand = TRUE))  #ignore the strand and count all the oxoG on the corresponding region
+gene_body$oxoG_trans_counts <- gene_body$oxoG_all_counts - gene_body$oxoG_nontrans_counts
+gene_body$strand_label <- as.character(strand(gene_body))
+
+gene_body$oxoG_nontrans_level <- gene_body$oxoG_nontrans_counts/ifelse(gene_body$strand_label == "+", gene_body$nG, gene_body$nC)
+gene_body$oxoG_trans_level <- gene_body$oxoG_trans_counts/ifelse(gene_body$strand_label == "+", gene_body$nC, gene_body$nG)
+gene_body$oxoG_all_level <- gene_body$oxoG_all_counts / (gene_body$nG + gene_body$nC)
+
+#normalize across sample by normF
+gene_body$oxoG_nontrans_level <- sweep(gene_body$oxoG_nontrans_level, 2, normF$Median, "/")
+gene_body$oxoG_nontrans_level <- gene_body$oxoG_nontrans_level*1000
+gene_body$oxoG_trans_level <- sweep(gene_body$oxoG_trans_level, 2, normF$Median, "/")
+gene_body$oxoG_trans_level <- gene_body$oxoG_trans_level*1000
+gene_body$oxoG_all_level <- sweep(gene_body$oxoG_all_level, 2, normF$Median, "/")
+gene_body$oxoG_all_level <- gene_body$oxoG_all_level*1000
+
+#Create SE
+oxi_gene_body_filtered <- SummarizedExperiment(
+  assays = list(oxoG_trans_counts = gene_body$oxoG_trans_counts,
+                oxoG_nontrans_counts= gene_body$oxoG_nontrans_counts, 
+                oxoG_all_counts= gene_body$oxoG_all_counts,
+                oxoG_trans_level = gene_body$oxoG_trans_level,
+                oxoG_nontrans_level= gene_body$oxoG_nontrans_level,
+                 oxoG_all_level= gene_body$oxoG_all_level),
+  rowData = list(nG = gene_body$nG, nC = gene_body$nC, strand = gene_body$strand_label),
+  colData = list(sampleID = colnames(gene_body$oxoG_trans_counts),
+                  condition = sapply(strsplit(colnames(gene_body$oxoG_trans_counts), "_"), function(x) x[2]),period = sapply(strsplit(colnames(gene_body$oxoG_trans_counts), "_"), function(x) x[3])))
+
+rownames(oxi_gene_body_filtered) <- unlist(gene_body$gene_id)
+rowData(oxi_gene_body_filtered)$gene_id <- rownames(oxi_gene_body_filtered)
+oxi_gene_body_filtered
+# need to adjust the rownames of gene_body object
+gtf <- import(ref_file)
+genes_gtf <- as.data.frame(gtf[gtf$type == "gene", ])
+symbols <- genes_gtf[genes_gtf$gene_id %in% rownames(oxi_gene_body_filtered),c("gene_id", "gene_name")]
+matched_symbols <- symbols$gene_name[match(rownames(oxi_gene_body_filtered), symbols$gene_id)]
+rowData(oxi_gene_body_filtered)$gene_symbol <- matched_symbols
+oxi_gene_body_filtered <- oxi_gene_body_filtered[!is.na(rowData(oxi_gene_body_filtered)$gene_symbol),]  
+rownames(oxi_gene_body_filtered) <- paste0(rowData(oxi_gene_body_filtered)$gene_id, ".", rowData(oxi_gene_body_filtered)$gene_symbol)
+
+oxoG_gene_body_filtered_pcgenes <- oxi_gene_body_filtered[sub("\\..*", "", rownames(oxi_gene_body_filtered)) %in% pc_gene[,1], ]
+#saveRDS(oxoG_gene_body_filtered_pcgenes, "objects/hippocampus_oxoG_genebody_protein_coding.rds")
+#saveRDS(oxi_gene_body_filtered, "objects/hippocampus_oxoG_genebody.rds")
+```
+
+### Differential analysis of genebody
+```{r}
+oxi_genebody <- readRDS("objects/hippocampus_oxoG_genebody.rds")
+normF <- read.csv("objects/hippocampus_oxoG_normalization_factor.csv")
+normF$Sample <- sub("^Sample_", "", normF$Sample)
+normF$Sample <- sub("_S[0-9]+$", "", normF$Sample)
+rownames(normF) <- normF$Sample
+
+condition <- oxi_genebody$condition
+condition <- factor(condition, levels = c("Ctrl", "CRS"))
+period <- oxi_genebody$period
+period <- factor(period, levels = c("evening", "morning"))
+group <- paste(condition, period, sep="_")
+group <- factor(group, levels = c("Ctrl_evening", "Ctrl_morning", "CRS_evening", "CRS_morning"))
+design_oxoG <- model.matrix(~0+group)
+colnames(design_oxoG) <- levels(group)
+design_oxoG
+contrast <- limma::makeContrasts(Morning_CRS_vs_Ctrl = CRS_morning - Ctrl_morning,
+                                 Evening_CRS_vs_Ctrl = CRS_evening - Ctrl_evening,
+                                 Ctrl_Morning_vs_Evening = Ctrl_morning - Ctrl_evening,
+                                 CRS_Morning_vs_Evening = CRS_morning - CRS_evening,
+                                 Morning_vs_Evening =  (CRS_morning + Ctrl_morning) / 2 - (CRS_evening + Ctrl_evening) / 2, 
+                                 CRS_vs_Ctrl = (CRS_morning + CRS_evening) / 2 - (Ctrl_morning + Ctrl_evening) / 2,
+                                 Diff = (CRS_morning - CRS_evening) - (Ctrl_morning - Ctrl_evening), 
+                                 levels = design_oxoG)
+contrast
+
+dge_genebody_trans <- DGEList(assay(oxi_genebody, "oxoG_trans_counts")) 
+dge_genebody_trans$samples$lib.size <- median(dge_genebody_trans$samples$lib.size) 
+
+dge_genebody_trans$samples$norm.factors <- normF[colnames(dge_genebody_trans),"Median"]
+y_genebody_trans <- estimateDisp(dge_genebody_trans, design_oxoG)
+fit_genebody_trans <- glmFit(y_genebody_trans, design_oxoG)
+lrt_genebody_trans <- glmLRT(fit_genebody_trans, contrast = contrast)
+results_genebody_trans <- topTags(lrt_genebody_trans, n = Inf)
+
+# run the DEA for each contrast group
+oxi_genebody <- Reduce(function(curr_se, nm) getDEA(fit_genebody_trans, contrast, nm, curr_se, "trans"),
+             colnames(contrast),
+             init = oxi_genebody)
+
+rowData(oxi_genebody)$FDR_trans <- results_genebody_trans$table[rownames(oxi_genebody), "FDR"]
+oxi_genebody$norm.factor_trans <- dge_genebody_trans$samples$norm.factors
+
+oxi_genebody$condition <- factor(oxi_genebody$condition, levels = c("Ctrl", "CRS"))
+
+oxi_genebody$period <- factor(oxi_genebody$period, levels = c("evening", "morning"))
+
+oxi_genebody$group <- factor(paste(oxi_genebody$condition, oxi_genebody$period, sep = "_"),
+  levels = c(
+    "Ctrl_morning",
+    "Ctrl_evening",
+    "CRS_morning",
+    "CRS_evening"))
+#saveRDS(oxi_genebody, "objects/hippocampus_oxoG_genebody_analysed.rds")
+```
+
+### Differential analysis of genebody (NON-STRAND SEPARATED)
+```{r}
+oxi_genebody <- readRDS("objects/hippocampus_oxoG_genebody.rds")
+normF <- read.csv("objects/hippocampus_oxoG_normalization_factor.csv")
+normF$Sample <- sub("^Sample_", "", normF$Sample)
+normF$Sample <- sub("_S[0-9]+$", "", normF$Sample)
+rownames(normF) <- normF$Sample
+
+condition <- oxi_genebody$condition
+condition <- factor(condition, levels = c("Ctrl", "CRS"))
+period <- oxi_genebody$period
+period <- factor(period, levels = c("evening", "morning"))
+group <- paste(condition, period, sep="_")
+group <- factor(group, levels = c("Ctrl_evening", "Ctrl_morning", "CRS_evening", "CRS_morning"))
+design_oxoG <- model.matrix(~0+group)
+colnames(design_oxoG) <- levels(group)
+design_oxoG
+contrast <- limma::makeContrasts(Morning_CRS_vs_Ctrl = CRS_morning - Ctrl_morning,
+                                 Evening_CRS_vs_Ctrl = CRS_evening - Ctrl_evening,
+                                 Ctrl_Morning_vs_Evening = Ctrl_morning - Ctrl_evening,
+                                 CRS_Morning_vs_Evening = CRS_morning - CRS_evening,
+                                 Morning_vs_Evening =  (CRS_morning + Ctrl_morning) / 2 - (CRS_evening + Ctrl_evening) / 2, 
+                                 CRS_vs_Ctrl = (CRS_morning + CRS_evening) / 2 - (Ctrl_morning + Ctrl_evening) / 2,
+                                 Diff = (CRS_morning - CRS_evening) - (Ctrl_morning - Ctrl_evening), 
+                                 levels = design_oxoG)
+contrast
+
+
+dge_genebody_all <- DGEList(assay(oxi_genebody, "oxoG_all_counts")) 
+dge_genebody_all$samples$lib.size <- median(dge_genebody_all$samples$lib.size) 
+
+dge_genebody_all$samples$norm.factors <- normF[colnames(dge_genebody_all),"Median"]
+y_genebody_all <- estimateDisp(dge_genebody_all, design_oxoG)
+fit_genebody_all <- glmFit(y_genebody_all, design_oxoG)
+lrt_genebody_all <- glmLRT(fit_genebody_all, contrast = contrast)
+results_genebody_all <- topTags(lrt_genebody_all, n = Inf)
+
+# run the DEA for each contrast group
+oxi_genebody <- Reduce(function(curr_se, nm) getDEA(fit_genebody_all, contrast, nm, curr_se, "all"),
+             colnames(contrast),
+             init = oxi_genebody)
+oxi_genebody
+
+
+rowData(oxi_genebody)$FDR_all <- results_genebody_all$table[rownames(oxi_genebody), "FDR"]
+oxi_genebody$norm.factor_all <- dge_genebody_all$samples$norm.factors
+oxi_genebody$condition <- factor(oxi_genebody$condition,levels = c("Ctrl", "CRS"))
+oxi_genebody$period <- factor(oxi_genebody$period,levels = c("evening", "morning"))
+oxi_genebody$group <- factor(paste(oxi_genebody$condition, oxi_genebody$period, sep = "_"),
+  levels = c(
+    "Ctrl_morning",
+    "Ctrl_evening",
+    "CRS_morning",
+    "CRS_evening"))
+#saveRDS(oxi_genebody, "objects/hippocampus_oxoG_genebody_combined_analysed.rds")
+```
+
+
+## Quantile plot
+### RNA for quantile plot
+```{r}
+RNA <-readRDS("objects/CRS2025_polyA_salmon.SE.rds")
+ref_file <- "objects/Mus_musculus.GRCm39.112.gtf"
+ref_txdb <- txdbmaker::makeTxDbFromGFF(ref_file, format = "gtf")
+keep_chrs <- paste0("chr", c(1:19, "X", "Y"))
+gene_body <- genes(ref_txdb, columns = c("gene_id"))
+seqlevelsStyle(gene_body) <- "UCSC"
+gene_body <- keepSeqlevels(gene_body, keep_chrs, pruning.mode = "coarse")  # Here the gene body covers the whole genome (all the normal chromosomes)
+rowData(RNA)$"whole_length" <- gene_body@ranges@width[match(sub("\\..*", "", rownames(RNA)), gene_body$gene_id)]
+RNA<- RNA[which(rowData(RNA)$"whole_length" !=0),]
+assay(RNA, "RPK") <- assay(RNA, "counts") / (rowData(RNA)$"whole_length" / 1000)
+total_RPK <- colSums(assay(RNA, "RPK"))
+assay(RNA, "TPM") <- t(t(assay(RNA, "RPK")) /total_RPK) * 1e6
+#saveRDS(RNA, "objects/CRS2025_polyA_quantile.rds")
+```
+
+### Oxidation for quantile plot
+```{r}
+RNA <- readRDS("objects/CRS2025_polyA_quantile.rds")
+genebody <- readRDS("objects/hippocampus_oxoG_genebody_protein_coding.rds")
+summary_df_trans <- quantile_plot_oxoG(genebody, RNA, "Transcribed", "genebody")
+saveRDS(summary_df_trans, "objects/hippocampus_oxoG_quantile_transcribed.rds")
+summary_df_non_trans <- quantile_plot_oxoG(genebody, RNA, "non-transcribed", "genebody")
+saveRDS(summary_df_non_trans, "objects/hippocampus_oxoG_quantile_non_transcribed.rds")
+```
+
+
+
+
+# Methylation in hippocampus
+
+## Promoter
+
+### Object generation
+```{r}
+bsseq_obj <- readRDS("objects/RRBS.rds")
+ref_file <- "objects/Mus_musculus.GRCm39.112.gtf"
+ref_txdb <- txdbmaker::makeTxDbFromGFF(ref_file,format = "gtf")
+
+# Extract promoter regions
+
+TSS <- transcripts(ref_txdb, columns = c("tx_name", "gene_id"))
+promoter <- promoters(TSS,upstream = 2000,downstream = 2000)
+promoter <- promoter[!duplicated(promoter)]
+
+# Split by gene
+prom2 <- split(promoter, unlist(promoter$gene_id))
+
+# Reduce (merge overlapping promoters within gene)
+promR <- reduce(prom2,min.gapwidth = 0L)
+promR2 <- unlist(promR)
+promR2$gene_id <- rep(names(promR),lengths(promR))
+
+# Match seqlevels to bsseq object
+seqlevelsStyle(promR2) <- seqlevelsStyle(bsseq_obj)
+keep_chrs <- paste0("chr",c(1:19, "X", "Y"))
+promR2 <- keepSeqlevels(promR2,keep_chrs,pruning.mode = "coarse")
+
+# Find CpG overlaps
+CpG_in_promoter_region <- findOverlaps(bsseq_obj,promR2)
+
+# Aggregate methylation (M)
+methyl_aggregate <- aggregate(assay(bsseq_obj,"M")[from(CpG_in_promoter_region), ],
+  list(promoter = promR2$gene_id[to(CpG_in_promoter_region)]),FUN = sum)
+row.names(methyl_aggregate) <- methyl_aggregate[, 1]
+methyl_aggregate <- as.matrix(methyl_aggregate[, -1])
+
+# Aggregate coverage (Cov)
+coverage_aggregate <- aggregate(assay(
+    bsseq_obj,
+    "Cov")[from(CpG_in_promoter_region), ],
+  list(promoter = promR2$gene_id[to(CpG_in_promoter_region)]),FUN = sum)
+row.names(coverage_aggregate) <- coverage_aggregate[, 1]
+coverage_aggregate <- as.matrix(coverage_aggregate[, -1])
+
+# Assign rowRanges
+rowRanges_obj <- promR2[match(row.names(methyl_aggregate), promR2$gene_id)]
+
+se <- SummarizedExperiment(list(M = methyl_aggregate, Cov = coverage_aggregate),
+      rowRanges = rowRanges_obj, colData = colData(bsseq_obj))
+
+# Convert to BSseq
+promoter_bsseq <- as(se,"BSseq")
+promoter_bsseq <- keepSeqlevels(promoter_bsseq, keep_chrs, pruning.mode = "coarse")
+promoter_bsseq <- renameSeqlevels(promoter_bsseq, mapSeqlevels(seqlevels(promoter_bsseq),"UCSC"))
+seqlevelsStyle(promoter_bsseq) <- "UCSC"
+gtf <- import(ref_file)
+genes_gtf <- as.data.frame(gtf[gtf$type == "gene", ])
+gene_ids <- rownames(promoter_bsseq)
+matched_symbols <- genes_gtf$gene_name[match(gene_ids,genes_gtf$gene_id)]
+mcols(promoter_bsseq)$gene_symbol <- matched_symbols
+row_filter <- which(rowSums(assay(promoter_bsseq, "Cov") >= 8) >= 15)
+promoter_bsseq_filtered <- promoter_bsseq[row_filter, ]
+
+#saveRDS(promoter_bsseq_filtered,"objects/promoter_RRBS.rds")
+```
+
+## Differential methylation analysis 
+```{r}
+promoter_bsseq_filtered <- readRDS("objects/promoter_RRBS.rds")
+group <- factor(paste(colData(promoter_bsseq_filtered)$Time, colData(promoter_bsseq_filtered)$Treatment, sep = "_"))
+
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+
+contrast <- makeContrasts(
+    Morning_CRS_vs_Ctrl = Morning_CRS - Morning_Ctrl,
+    Evening_CRS_vs_Ctrl = Evening_CRS - Evening_Ctrl,
+    Ctrl_Morning_vs_Evening = Morning_Ctrl - Evening_Ctrl,
+    CRS_Morning_vs_Evening = Morning_CRS - Evening_CRS,
+    Morning_vs_Evening = (Morning_CRS + Morning_Ctrl)/2 - (Evening_CRS + Evening_Ctrl)/2,
+    CRS_vs_Ctrl = (Morning_CRS + Evening_CRS)/2 - (Morning_Ctrl + Evening_Ctrl)/2,
+    Diff = (Morning_CRS - Evening_CRS) - (Morning_Ctrl - Evening_Ctrl),
+    levels = design)
+M <- assay(promoter_bsseq_filtered, "M")
+Cov <- assay(promoter_bsseq_filtered, "Cov")
+beta <- M / Cov
+
+fit <- lmFit(beta, design)
+fit <- contrasts.fit(fit, contrast)
+fit <- eBayes(fit)
+
+for(nm in colnames(contrast)) {
+    res <- topTable(
+        fit,
+        coef = nm,
+        number = Inf,
+        sort.by = "none")
+    rowData(promoter_bsseq_filtered)[[paste0(nm, "_logFC")]] <- res$logFC
+    rowData(promoter_bsseq_filtered)[[paste0(nm, "_PValue")]] <- res$P.Value
+    rowData(promoter_bsseq_filtered)[[paste0(nm, "_FDR")]] <- res$adj.P.Val
+}
+
+#saveRDS(promoter_bsseq_filtered,"objects/RRBS_promoter_analysed.rds")
+```
+
+## Genebody
+
+### Object generation
+```{r}
+bsseq_obj <- readRDS("objects/RRBS.rds")
+ref_file <- "objects/Mus_musculus.GRCm39.112.gtf"
+ref_txdb <- txdbmaker::makeTxDbFromGFF(ref_file, format = "gtf")
+gene_body <- genes(ref_txdb, columns = c("gene_id"))
+seqlevelsStyle(gene_body) <- seqlevelsStyle(bsseq_obj)
+keep_chrs <- paste0("chr", c(1:19, "X", "Y"))
+gene_body <- keepSeqlevels(gene_body,keep_chrs,pruning.mode = "coarse")
+
+CpG_in_gene_body <- findOverlaps(bsseq_obj, gene_body)
+
+methyl_aggregate <- aggregate(assay(bsseq_obj, "M")[from(CpG_in_gene_body), ],
+    list(gene = gene_body$gene_id[to(CpG_in_gene_body)]),FUN = sum)
+
+rownames(methyl_aggregate) <- methyl_aggregate[,1]
+methyl_aggregate <- as.matrix(methyl_aggregate[, -1])
+
+coverage_aggregate <- aggregate(assay(bsseq_obj, "Cov")[from(CpG_in_gene_body),],
+    list(gene = gene_body$gene_id[to(CpG_in_gene_body)]),FUN = sum)
+rownames(coverage_aggregate) <- coverage_aggregate[,1]
+coverage_aggregate <- as.matrix(coverage_aggregate[, -1])
+
+rowRanges_obj <- gene_body[match(rownames(methyl_aggregate),gene_body$gene_id)]
+
+se <- SummarizedExperiment(assays = list(M = methyl_aggregate,Cov = coverage_aggregate),
+    rowRanges = rowRanges_obj, colData = colData(bsseq_obj))
+
+genebody_bsseq <- as(se, "BSseq")
+gtf <- import(ref_file)
+genes_gtf <- as.data.frame(gtf[gtf$type == "gene", ])
+matched_symbols <- genes_gtf$gene_name[match(rownames(genebody_bsseq),genes_gtf$gene_id)]
+mcols(genebody_bsseq)$gene_symbol <- matched_symbols
+row_filter <- which(rowSums(assay(genebody_bsseq, "Cov") >= 8) >= 15)
+
+genebody_bsseq_filtered <- genebody_bsseq[row_filter,]
+genebody_bsseq_filtered <- genebody_bsseq_filtered[!is.na(rowData(genebody_bsseq_filtered)$gene_symbol),]
+
+#saveRDS(genebody_bsseq_filtered,"objects/genebody_RRBS.rds")
+```
+
+### Differential methylation analysis
+```{r}
+genebody_bsseq_filtered <- readRDS("objects/genebody_RRBS.rds")
+
+group <- factor(paste(colData(genebody_bsseq_filtered)$Time, colData(genebody_bsseq_filtered)$Treatment,sep = "_"))
+
+
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+
+contrast <- makeContrasts(
+    Morning_CRS_vs_Ctrl = Morning_CRS - Morning_Ctrl,
+    Evening_CRS_vs_Ctrl = Evening_CRS - Evening_Ctrl,
+    Ctrl_Morning_vs_Evening = Morning_Ctrl - Evening_Ctrl,
+    CRS_Morning_vs_Evening = Morning_CRS - Evening_CRS,
+    Morning_vs_Evening = (Morning_CRS + Morning_Ctrl)/2 - (Evening_CRS + Evening_Ctrl)/2,
+    CRS_vs_Ctrl = (Morning_CRS + Evening_CRS)/2 - (Morning_Ctrl + Evening_Ctrl)/2,
+    Diff = (Morning_CRS - Evening_CRS) - (Morning_Ctrl - Evening_Ctrl),
+    levels = design)
+M <- assay(genebody_bsseq_filtered, "M")
+Cov <- assay(genebody_bsseq_filtered, "Cov")
+beta <- M / Cov
+
+fit <- lmFit(beta, design)
+fit <- contrasts.fit(fit, contrast)
+fit <- eBayes(fit)
+
+for(nm in colnames(contrast)) {
+    res <- topTable(fit, coef = nm, number = Inf, sort.by = "none")
+    rowData(genebody_bsseq_filtered)[[paste0(nm, "_logFC")]] <- res$logFC
+    rowData(genebody_bsseq_filtered)[[paste0(nm, "_PValue")]] <- res$P.Value
+    rowData(genebody_bsseq_filtered)[[paste0(nm, "_FDR")]] <- res$adj.P.Val
+}
+
+#saveRDS(genebody_bsseq_filtered,"objects/RRBS_genebody_analysed.rds")
+```
+
+
+## Methylation in GR binding regions
+
+```{r}
+library(GenomicRanges)
+
+# Read data
+mergedPeaks_BLAM <- readRDS("objects/Methylation_mergedPeaks_BLAM.rds")
+mergedPeaks_BLPM <- readRDS("objects/Methylation_mergedPeaks_BLPM.rds")
+mergedPeaks_stress <- readRDS("objects/Methylation_mergedPeaks_stress.rds")
+bsseq_obj <- readRDS("objects/RRBS.rds")
+
+# Extract CpG coordinates
+CpG_sites <- granges(bsseq_obj)
+
+# Find overlaps between CpGs and GR peaks
+CpG_in_GR_region_BLAM <- findOverlaps(CpG_sites,mergedPeaks_BLAM)
+
+CpG_in_GR_region_BLPM <- findOverlaps(CpG_sites,mergedPeaks_BLPM)
+
+CpG_in_GR_region_stress <- findOverlaps(CpG_sites,mergedPeaks_stress)
+
+# Define GR region classes
+CpG_all_region <- union(union(queryHits(CpG_in_GR_region_BLAM),queryHits(CpG_in_GR_region_BLPM)),queryHits(CpG_in_GR_region_stress))
+
+CpG_PM_only <- setdiff(queryHits(CpG_in_GR_region_BLPM),queryHits(CpG_in_GR_region_BLAM))
+
+# Remove duplicates
+CpG_all_region <- unique(CpG_all_region)
+CpG_PM_only <- unique(CpG_PM_only)
+
+# Create BSseq objects
+bsseq_GR_all_region <- bsseq_obj[CpG_all_region, ]
+bsseq_GR_PM_only <- bsseq_obj[CpG_PM_only, ]
+
+# Save for downstream analysis
+saveRDS(bsseq_GR_all_region,file = "objects/Methylation_GR_all_region.rds")
+saveRDS(bsseq_GR_PM_only,file = "objects/Methylation_GR_PM_more_than_AM.rds")
+```
+
+
+```{r}
+# Read objects
+bsseq_GR_all_region <- readRDS("objects/Methylation_GR_all_region.rds")
+bsseq_GR_PM_only <- readRDS("objects/Methylation_GR_PM_more_than_AM.rds")
+
+# Filter CpGs
+row_filter <- which(rowSums(assay(bsseq_GR_all_region, "Cov") >= 5) >= 15)
+bsseq_GR_all_region <- bsseq_GR_all_region[row_filter, ]
+
+# Calculate methylation level
+assay(bsseq_GR_all_region, "methyl_level") <- (assay(bsseq_GR_all_region, "M") + 1)/(assay(bsseq_GR_all_region, "Cov") + 1)
+
+# Evening control baseline
+baseline <- rowMeans(assay(bsseq_GR_all_region, "methyl_level")[,colData(bsseq_GR_all_region)$Group == "Evening_Ctrl"])
+
+# Difference to baseline
+assay(bsseq_GR_all_region, "diff") <- assay(bsseq_GR_all_region, "methyl_level") - baseline
+
+# Identify PM_only CpGs
+ov <- findOverlaps(granges(bsseq_GR_PM_only), granges(bsseq_GR_all_region))
+pm_idx <- unique(subjectHits(ov))
+
+# Mean methylation difference per sample
+sample_mean_PM_only <- colMeans(assay(bsseq_GR_all_region, "diff")[pm_idx, ], na.rm = TRUE)
+
+# Create export dataframe
+export_df <- data.frame(Condition = ifelse(grepl("_CRS", names(sample_mean_PM_only)),"crs","ctrl"),
+  Methylation = sample_mean_PM_only,
+  Period = ifelse(grepl("^Morning", names(sample_mean_PM_only)),"morning","evening"))
+
+# Export
+#write.xlsx(export_df,file = "objects/Methylation_in_GR_binding_regions.xlsx",rowNames = FALSE)
+```
+
+# Oxidation vs Methylation in hipppcampus
+
+```{r}
+meth <- readRDS("objects/RRBS.rds")
+genome <- BSgenome.Mmusculus.UCSC.mm39
+seq_meth <- getSeq(genome, granges(meth))
+keep <- which(seq_meth == "C")
+meth <- meth[keep,]
+Group <- factor(colData(meth)$Group, levels = unique(colData(meth)$Group))
+agg_M <- t(rowsum(t(assay(meth, "M")), group = Group))
+agg_Cov <- t(rowsum(t(assay(meth, "Cov")), group = Group))
+meth_agg <- BSseq(gr = rowRanges(meth), M = agg_M, Cov = agg_Cov,sampleNames = colnames(agg_M))  
+meth_agg <- meth_agg[rowSums(assay(meth_agg, "Cov") >= 10) == ncol(assay(meth_agg, "Cov")), ] 
+```
+
+```{r}
+oxi <- readRDS("objects/hippocampus_oxoG.rds") 
+genome <- BSgenome.Mmusculus.UCSC.mm39
+cpg_plus <- granges(meth_agg)  # now in this "cpg", the info is the position of the "C" of the CpG site ON the + strand.
+end(cpg_plus) <- start(cpg_plus)+1 
+start(cpg_plus) <- start(cpg_plus)+1  # now we changed the position to the "G" of the CpG site
+# check if they are all "G"s
+seq_cpg_plus <- getSeq(genome, cpg_plus)
+table(seq_cpg_plus)
+# there are some A and C (?)
+# remove them:
+meth_agg <- meth_agg[which(seq_cpg_plus == "G"),]
+cpg_plus <- cpg_plus[which(seq_cpg_plus == "G"),]
+# also we know that the position info in this obj is on the "+" strand (ref genome is always on the "+")
+strand(cpg_plus) <- "+"
+
+# now we count the oxoG 
+# firstly calculate "+" strand:
+rowData(meth_agg)$oxoG_counts <- sapply(oxi, \(x) countOverlaps(cpg_plus, x, ignore.strand = FALSE))  # Count how many oxoG sites overlap each CpG (on + strand)
+
+# for "-" strand:
+cpg_minus <- granges(meth_agg)
+strand(cpg_minus) <- "-"
+# check again if they are all "G"s
+seq_cpg_minus <- getSeq(genome, cpg_minus)
+table(seq_cpg_minus)
+# Now sum two strands up
+rowData(meth_agg)$oxoG_counts <- rowData(meth_agg)$oxoG_counts + sapply(oxi, \(x) countOverlaps(cpg_minus, x, ignore.strand = FALSE)) 
+
+# normalize across the samples
+normF <- read.csv("objects/hippocampus_oxoG_normalization_factor.csv")
+normF$Sample <- gsub("^Sample_|_S[0-9]+$", "", normF$Sample)
+normF <- normF[match(colnames(rowData(meth_agg)$oxoG_counts), normF$Sample),]
+rowData(meth_agg)$oxoG_counts <-sweep(rowData(meth_agg)$oxoG_counts, 2, normF$Median, "/")
+rowData(meth_agg)$oxoG_counts <- rowData(meth_agg)$oxoG_counts*1000
+
+# now we use log1p() to reduce the variability of the data
+rowData(meth_agg)$oxoG_counts <- log1p(rowData(meth_agg)$oxoG_counts)
+```
+
+```{r}
+assay(meth_agg, "methyl_level") <- (assay(meth_agg, "M"))/(assay(meth_agg, "Cov"))
+#Binning only according to control morning
+meth_ctrl <- assay(meth_agg, "methyl_level")[, "Morning_Ctrl"]
+rowData(meth_agg)$methyl_label <- case_when(
+    meth_ctrl <= 0.1 ~ "No",
+    meth_ctrl > 0.5  ~ "High",
+    TRUE             ~ "Medium")
+saveRDS(meth_agg, "objects/hipppocampus_oxoG_methylation.rds")
+```
+
+# Embryonic brains
+
+## Methylation in embryonic brains
+
+```{r}
+meth <- readRDS("objects/embryonic_bsobj.rds")
+# load genome, filter for CpG sites
+genome_mm39 <- BSgenome.Mmusculus.UCSC.mm39
+
+seq_meth <- getSeq(genome_mm39, granges(meth))
+table(seq_meth == "C")
+meth <- meth[which(seq_meth == "C"),]
+cpg_plus <- granges(meth) 
+end(cpg_plus) <- start(cpg_plus)+1 
+start(cpg_plus) <- start(cpg_plus)+1  
+seq_cpg_plus <- getSeq(genome_mm39, cpg_plus)
+table(seq_cpg_plus)
+meth <- meth[which(seq_cpg_plus == "G"),]
+cpg_plus <- cpg_plus[which(seq_cpg_plus == "G"),]
+strand(cpg_plus) <- "+"
+
+# Filter for minimal coverage, calculate methylation level + assign methylation category based on control data
+meth <- meth[rowSums(assay(meth, "Cov") >= 10) == ncol(assay(meth, "Cov")), ] 
+assay(meth, "methyl_level") <- (assay(meth, "M")+1)/(assay(meth, "Cov")+1)
+rowData(meth)$methyl_label <- ifelse(assay(meth, "methyl_level")[,"E4"] <= 0.1, 
+                                         yes = "No", 
+                                         no = ifelse(assay(meth, "methyl_level")[,"E4"] > 0.5, 
+                                                     yes = "High", no = "Medium"))
+saveRDS(meth, "objects/embryonic_bsobj_cpg.rds")
+```
+
+## Oxidation vs Methylation in embryonic brains
+
+```{r}
+# Load object, assign conditions
+oxi <- readRDS("objects/embryonic_oxoG.rds")
+meth <- readRDS("objects/embryonic_bsobj_cpg.rds")
+names(oxi) <- c("DE01", "DE02", "DE03", "DE04", "DE05", "DE06")
+
+meth_2 <- SummarizedExperiment(  
+  rowRanges = granges(meth),
+  assays = list(
+    oxoG_counts = sapply(oxi, \(x) countOverlaps(cpg_plus, x, ignore.strand = FALSE))),
+  colData = DataFrame(sample = c("DE01","DE02", "DE03", "DE04", "DE05", "DE06"), group = c("mut", "wt", "wt", "wt","mut","mut")))
+
+# Calculate oxoG counts on oppsite strand of methylated CpGs 
+cpg_minus <- granges(meth)
+strand(cpg_minus) <- "-"
+seq_cpg_minus <- getSeq(genome_mm39, cpg_minus)
+assay(meth_2,"oxoG_counts") <- assay(meth_2,"oxoG_counts") + sapply(oxi, \(x) countOverlaps(cpg_minus, x, ignore.strand = FALSE)) 
+
+# Normalize across samples, transform with log
+normF <- read.csv("objects/embryonic_oxoG_normalization_factor.csv")
+assay(meth_2,"oxoG_counts") <- sweep(assay(meth_2,"oxoG_counts"), 2, normF$Median, "/")
+assay(meth_2,"oxoG_counts") <- assay(meth_2,"oxoG_counts")*1000
+assay(meth_2,"oxoG_counts") <- log1p(assay(meth_2,"oxoG_counts"))
+assay(meth_2,"oxoG_counts_bi") <- ifelse(assay(meth_2,"oxoG_counts")>0, 1, 0)
+saveRDS(meth_2, "objects/embryonic_meth_oxoG_cpg.rds")
+```
+
+
+## Dinucleotide analysis in embryonic brains (oxoG)
+
+```{r}
+# Load object and genome
+oxi <- readRDS("objects/embryonic_oxoG.rds")
+names(oxi) <- c("DE01", "DE02", "DE03", "DE04", "DE05", "DE06")
+genome <- BSgenome.Mmusculus.UCSC.mm39
+seqs <- getSeq(genome)
+seqs <- seqs[names(seqs) %in% c(paste0("chr", 1:19), "chrX", "chrY"),]
+
+# extract oxoG levels of dinucleotides
+# # ========================== for ApGs ==========================
+ ApG_gr <- get_dinuc_granges(seq = seqs, dinuc = "AG")
+ gc()
+ ag_tmp <- lapply(oxi, \(x) as(countOverlaps(ApG_gr, x, ignore.strand = FALSE), "sparseVector"))
+ ApG_gr$oxoG_counts <- do.call(cbind, lapply(ag_tmp, function(v) as(v, "CsparseMatrix")))
+ gc()
+ rm(ag_tmp)
+ normF <- read.csv("objects/embryonic_oxoG_normalization_factor.csv")
+ ApG_gr$oxoG_level <- t(t(ApG_gr$oxoG_counts)*1000/normF$Median)
+  saveRDS(ApG_gr, "objects/embryonic_oxoG_ApG.rds")
+ gc()
+ rm(ApG_gr)
+# # ========================== for TpGs ==========================
+ TpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "TG")
+ gc()
+ tg_tmp <- lapply(oxi, \(x) as(countOverlaps(TpG_gr, x, ignore.strand = FALSE), "sparseVector"))
+ TpG_gr$oxoG_counts <- do.call(cbind, lapply(tg_tmp, function(v) as(v, "CsparseMatrix")))
+ gc()
+ rm(tg_tmp)
+ TpG_gr$oxoG_level <- t(t(TpG_gr$oxoG_counts)*1000/normF$Median)
+  saveRDS(TpG_gr, "objects/embryonic_oxoG_TpG.rds")
+ gc()
+ rm(TpG_gr)
+# # ========================== for CpGs ==========================
+ CpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "CG")
+ gc()
+ cg_tmp <- lapply(oxi, \(x) as(countOverlaps(CpG_gr, x, ignore.strand = FALSE), "sparseVector"))
+ CpG_gr$oxoG_counts <- do.call(cbind, lapply(cg_tmp, function(v) as(v, "CsparseMatrix")))
+ gc()
+ rm(cg_tmp)
+ CpG_gr$oxoG_level <- t(t(CpG_gr$oxoG_counts)*1000/normF$Median)
+  saveRDS(CpG_gr, "objects/embryonic_oxoG_CpG.rds")
+ gc()
+ rm(CpG_gr)
+# # ========================== for GpGs ==========================
+ GpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "GG")
+ gc()
+ gg_tmp <- lapply(oxi, \(x) as(countOverlaps(GpG_gr, x, ignore.strand = FALSE), "sparseVector"))
+ GpG_gr$oxoG_counts <- do.call(cbind, lapply(gg_tmp, function(v) as(v, "CsparseMatrix")))
+ gc()
+ rm(gg_tmp)
+ GpG_gr$oxoG_level <- t(t(GpG_gr$oxoG_counts)*1000/normF$Median)
+  saveRDS(GpG_gr, "objects/embryonic_oxoG_GpG.rds")
+ gc()
+ rm(GpG_gr)
+ 
+ApG_gr <- readRDS("objects/embryonic_oxoG_ApG.rds")
+TpG_gr <- readRDS("objects/embryonic_oxoG_TpG.rds")
+CpG_gr <- readRDS("objects/embryonic_oxoG_CpG.rds")
+GpG_gr <- readRDS("objects/embryonic_oxoG_GpG.rds")
+gc()
+
+dinuc <- data.frame(
+    ApG = sapply(seq_len(ncol(ApG_gr$oxoG_level)), \(i) {mean(ApG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+    TpG = sapply(seq_len(ncol(TpG_gr$oxoG_level)), \(i) {mean(TpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+    CpG = sapply(seq_len(ncol(CpG_gr$oxoG_level)), \(i) {mean(CpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+    GpG = sapply(seq_len(ncol(GpG_gr$oxoG_level)), \(i) {mean(GpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+    sample = c("DE01","DE02", "DE03", "DE04", "DE05", "DE06"),
+    group = c("mut", "wt", "wt", "wt","mut","mut")
+)
+
+saveRDS(dinuc, "objects/embryo_dinuc_summary.rds")
+```
+
+## Dinucleotide analysis in satellite regions of enmrbyonic brains
+```{r}
+ah <- AnnotationHub()
+query(ah, c("Mus musculus", "mm39", "RepeatMasker"))
+query(ah, c("mm39", "RepeatMasker"))
+rmsk <- ah[["AH99013"]]
+major_satellite <- rmsk[rmsk$repName == "GSAT_MM"]
+major_satellite <- reduce(major_satellite)
+
+oxi <- readRDS("objects/embryonic_oxoG.rds")
+names(oxi) <- c("DE01", "DE02", "DE03", "DE04", "DE05", "DE06")
+
+sapply(oxi, function(x)
+  length(subsetByOverlaps(x, major_satellite)))
+
+oxi_sat <- lapply(
+  oxi,
+  function(x)
+    subsetByOverlaps(x, major_satellite, ignore.strand = FALSE))
+
+saveRDS(oxi_sat, "objects/embryonic_oxoG_satellite.rds")
+
+genome <- BSgenome.Mmusculus.UCSC.mm39
+seqs <- getSeq(genome)
+seqs <- seqs[names(seqs) %in% c(paste0("chr", 1:19), "chrX", "chrY")]
+
+# ========================== for ApGs ==========================
+
+ApG_gr <- get_dinuc_granges(seq = seqs, dinuc = "AG")
+ApG_gr <- subsetByOverlaps(ApG_gr, major_satellite)
+gc()
+ag_tmp <- lapply(
+  oxi_sat,
+  \(x) as(
+    countOverlaps(
+      ApG_gr,
+      x,
+      ignore.strand = FALSE), "sparseVector"))
+
+ApG_gr$oxoG_counts <- do.call(
+  cbind,
+  lapply(ag_tmp, function(v) as(v, "CsparseMatrix")))
+colnames(ApG_gr$oxoG_counts) <- names(oxi_sat)
+gc()
+rm(ag_tmp)
+
+normF <- read.csv("objects/embryonic_oxoG_normalization_factor.csv")
+ApG_gr$oxoG_level <- t(t(ApG_gr$oxoG_counts)*100/normF$Median)
+
+colnames(ApG_gr$oxoG_level) <- names(oxi_sat)
+
+saveRDS(ApG_gr,"objects/embryonic_oxoG_ApG_satellite.rds")
+gc()
+rm(ApG_gr)
+
+# ========================== for TpGs ==========================
+
+TpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "TG")
+TpG_gr <- subsetByOverlaps(TpG_gr, major_satellite)
+gc()
+tg_tmp <- lapply(
+  oxi_sat,
+  \(x) as(
+    countOverlaps(
+      TpG_gr,
+      x,
+      ignore.strand = FALSE
+    ),"sparseVector"))
+
+TpG_gr$oxoG_counts <- do.call(cbind, lapply(tg_tmp, function(v) as(v, "CsparseMatrix")))
+
+colnames(TpG_gr$oxoG_counts) <- names(oxi_sat)
+gc()
+rm(tg_tmp)
+
+TpG_gr$oxoG_level <- t(t(TpG_gr$oxoG_counts) * 100 / normF$Median)
+colnames(TpG_gr$oxoG_level) <- names(oxi_sat)
+saveRDS(TpG_gr,"objects/embryonic_oxoG_TpG_satellite.rds")
+gc()
+rm(TpG_gr)
+
+# ========================== for CpGs ==========================
+
+CpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "CG")
+CpG_gr <- subsetByOverlaps(CpG_gr, major_satellite)
+gc()
+cg_tmp <- lapply(
+  oxi_sat,
+  \(x) as(
+    countOverlaps(
+      CpG_gr,
+      x,
+      ignore.strand = FALSE
+    ),"sparseVector"))
+
+CpG_gr$oxoG_counts <- do.call(cbind,lapply(cg_tmp, function(v) as(v, "CsparseMatrix")))
+
+colnames(CpG_gr$oxoG_counts) <- names(oxi_sat)
+gc()
+rm(cg_tmp)
+
+CpG_gr$oxoG_level <- t(t(CpG_gr$oxoG_counts) * 100 / normF$Median)
+colnames(CpG_gr$oxoG_level) <- names(oxi_sat)
+saveRDS(CpG_gr,"objects/embryonic_oxoG_CpG_satellite.rds")
+gc()
+rm(CpG_gr)
+
+# ========================== for GpGs ==========================
+
+GpG_gr <- get_dinuc_granges(seq = seqs, dinuc = "GG")
+GpG_gr <- subsetByOverlaps(GpG_gr, major_satellite)
+gc()
+gg_tmp <- lapply(
+  oxi_sat,
+  \(x) as(
+    countOverlaps(
+      GpG_gr,
+      x,
+      ignore.strand = FALSE),"sparseVector"))
+
+GpG_gr$oxoG_counts <- do.call(cbind, lapply(gg_tmp, function(v) as(v, "CsparseMatrix")))
+
+colnames(GpG_gr$oxoG_counts) <- names(oxi_sat)
+gc()
+rm(gg_tmp)
+
+GpG_gr$oxoG_level <- t(t(GpG_gr$oxoG_counts) * 100 / normF$Median)
+colnames(GpG_gr$oxoG_level) <- names(oxi_sat)
+saveRDS(GpG_gr,"objects/embryonic_oxoG_GpG_satellite.rds")
+gc()
+rm(GpG_gr)
+
+ApG_gr <- readRDS("objects/embryonic_oxoG_ApG_satellite.rds")
+TpG_gr <- readRDS("objects/embryonic_oxoG_TpG_satellite.rds")
+CpG_gr <- readRDS("objects/embryonic_oxoG_CpG_satellite.rds")
+GpG_gr <- readRDS("objects/embryonic_oxoG_GpG_satellite.rds")
+gc()
+
+dinuc <- data.frame(
+    ApG = sapply(seq_len(ncol(ApG_gr$oxoG_level)), \(i) {mean(ApG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+    TpG = sapply(seq_len(ncol(TpG_gr$oxoG_level)), \(i) {mean(TpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+    CpG = sapply(seq_len(ncol(CpG_gr$oxoG_level)), \(i) {mean(CpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+    GpG = sapply(seq_len(ncol(GpG_gr$oxoG_level)), \(i) {mean(GpG_gr$oxoG_level[, i], na.rm = TRUE, trim = 0.001)}),
+    sample = c("DE01","DE02", "DE03", "DE04", "DE05", "DE06"),
+    group = c("mut", "wt", "wt", "wt","mut","mut"))
+
+saveRDS(dinuc, "objects/embryo_dinuc_summary_satellite.rds")
+```
+
+
+# OFT 
+
+```{r}
+source("/mnt/gapp/work/vincent/behavior/BFA_BFF.R") # this set of functions get updatet by F.R. from time to time, make sure to have the newest you can get them from Github
+source("/mnt/gapp/work/vincent/behavior/DLCAnalyzer.R") # this set of functions get updatet by F.R. from time to time, make sure to have the newest you can get them from Github
+
+meta <- openxlsx::read.xlsx("objects/OFT_metadata.xlsx",detectDates = T)
+#meta <- meta[1:16,]
+
+TrackingAll <- readRDS(file = "objects/TS_AllData_OFT_OriginalClusters.rds")
+
+names(TrackingAll[[1]]$labels)
+
+US <- LoadFromTrackingObject(TrackingAll)
+
+US <- SmoothLabels_US(US, integration_period = 5)
+
+US <- CalculateMetrics(US)
+
+US <- AddTransitionMatrixData(US)
+
+US <- AddConfusionMatrix(US)
+
+row.names(meta) <- (meta$OFTfile) 
+US$file_names %in% rownames(meta)
+
+US <- AddMetaData(US,meta)
+
+saveRDS(US, "objects/US_OFT.rds")
+
+US <- readRDS("objects/US_OFT.rds")
+US <- TwoGroupAnalysis(US, group = US$meta$condition)
+#US <- TwoGroupAnalysis_Clusters(US, group = US$meta$condition)
+
+saveRDS(US,"objects/US_OFT_analyzed.rds")
+```
+
+# Functions
+
+### Staged Interaction
+```{r}
+stagedInteractionsCont <- function(se, screen, fullFit, coefs=NULL){
+  library(stageR)
+  pScreen <- setNames(screen$PValue, row.names(screen))
+  if(is.null(coefs))
+    con <- my.contrast
+  if(is.null(colnames(con))) colnames(con) <- make.names(con)
+  deas <- lapply(colnames(con), FUN=function(co){
+    as.data.frame(topTags(glmLRT(fullFit,contrast =  con[,co]), Inf)) #change with glmFit
+  })
+  names(deas) <- colnames(con)
+  pConf <- as.data.frame(lapply(deas, FUN=function(x) x[names(pScreen),"PValue"]))
+  row.names(pConf) <- names(pScreen)
+  colnames(pConf) <- colnames(con)
+  stageRObj <- stageR(pScreen=pScreen, pConfirmation=as.matrix(pConf), pScreenAdjusted=FALSE)
+  stageRObj <- stageWiseAdjustment(object=stageRObj, method="none", alpha=0.05)
+  res <- as.data.frame(getAdjustedPValues(stageRObj, onlySignificantGenes=FALSE, order=FALSE))
+  res <- res[,-1,drop=FALSE]
+  for(f in colnames(res)){
+    deas[[f]][row.names(res),"FDR"] <- res[,f]
+    rowData(se)[[paste0("DEA.stage.",f)]] <- deas[[f]][row.names(se),]
+  }
+  if(ncol(res)>1){
+    rowData(se)$int.minFDR <- 1
+    rowData(se)[row.names(res),"stage.minFDR"] <- matrixStats::rowMins(as.matrix(res))
+  }
+  se
+}
+```
+
+###  extract oxoG levels of dinucleotides
+```{r}
+get_dinuc_granges <- function(seq, dinuc){
+   pattern_plus <- dinuc
+   pattern_minus <- as.character(reverseComplement(DNAString(dinuc)))
+   gr_plus <- lapply(names(seq), function(chr) {
+         hits <- matchPattern(pattern_plus, seq[[chr]])
+        GRanges(seqnames = chr, ranges = IRanges(start(hits), end(hits)))
+        })
+  gr_plus <- do.call(c, gr_plus)
+   strand(gr_plus) <- "+"
+  gr_minus <- lapply(names(seq), function(chr) {
+     hits <- matchPattern(pattern_minus, seq[[chr]])
+    GRanges(seqnames = chr, ranges = IRanges(start(hits), end(hits)))
+   })
+   gr_minus <- do.call(c, gr_minus)
+   strand(gr_minus) <- "-"
+   dinuc_granges <- c(gr_plus, gr_minus)
+   dinuc_granges <- resize(dinuc_granges, 1L, fix="end") 
+   return(dinuc_granges)
+}
+```
+
+###Strand-specific differential analysis of oxoG
+```{r}
+getDEA <- function(fit, cont_M, cont_group, se, strand){
+  lrt <- glmLRT(fit, contrast = cont_M[,cont_group])
+  results <- as.data.frame(topTags(lrt, n = Inf))
+  name <- paste0("DEA.", strand, ".", cont_group)
+  rowData(se)[[name]] <- results[row.names(se),]
+  return(se)
+}
+```
+
+### Differential methylation analysis
+```{r}
+getDEA_meth <- function(fit, cont_M, cont_group, se){
+  lrt <- glmLRT(fit, contrast = cont_M[, cont_group])
+  results <- as.data.frame(topTags(lrt, n = Inf))
+  name <- paste0("DEA.meth.",cont_group)
+  rowData(se)[[name]] <- results[rownames(se), ]
+  return(se)
+}
+```
+
+### Amplitude calculation
+```{r}
+calculate_amplitudes <- function(genes,se){
+  expr <- assays(se)$logcpm
+  meta <- as.data.frame(colData(se))
+  amp_df <- data.frame()
+  for(gene in genes){
+    ctrl_morning <- mean(
+      expr[gene, meta$Condition == "Ctrl" & meta$Period == "morning"])
+    ctrl_evening <- mean(
+      expr[gene, meta$Condition == "Ctrl" & meta$Period == "evening"])
+    crs_morning <- mean(
+      expr[gene, meta$Condition == "CRS" & meta$Period == "morning"])
+    crs_evening <- mean(
+      expr[gene, meta$Condition == "CRS" & meta$Period == "evening"])
+    CTRL_logFC <- ctrl_morning - ctrl_evening
+    CRS_logFC <- crs_morning - crs_evening
+    CTRL_amp <- abs(CTRL_logFC)
+    CRS_amp <- abs(CRS_logFC)
+    amp_df <- rbind(
+      amp_df,
+      data.frame(
+        Gene = gene,
+        CTRL_logFC = CTRL_logFC,
+        CRS_logFC = CRS_logFC,
+        CTRL_amp = CTRL_amp,
+        CRS_amp = CRS_amp,
+        delta_amp = CTRL_amp - CRS_amp))
+  }
+  amp_df
+}
+```
+
+### Quantile plot function
+```{r}
+quantile_plot_oxoG <- function(data, RNA, TorN, PorG){
+  if (TorN == "Transcribed") {
+    corr <- as.data.frame(assay(data, "oxoG_trans_level"))
+  } 
+  else { corr <- as.data.frame(assay(data, "oxoG_nontrans_level"))}
+  corr$ID <- rowData(data)$gene_id
+  RNAranking <- as.data.frame(assay(RNA, "TPM")[match(corr$ID, sub("\\..*", "", names(RNA))), ])
+  RNAranking <- na.omit(RNAranking)
+  RNAranking$TPM_mean <- rowMeans(RNAranking)
+  tmp <- RNAranking[RNAranking$TPM_mean != 0, ]
+  expression <- tmp$TPM_mean
+  perc_list <- c(10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+  quantiles <- quantile(expression, prob = perc_list / 100)
+  breaks <- c(-1, 0, as.numeric(quantiles))
+  groups <- c( "unexpr","≤ 10%", "≤ 20%", "≤ 30%", "≤ 40%","≤ 50%", "≤ 60%", "≤ 70%", "≤ 80%","≤ 90%", "≤ 100%")
+
+  RNAranking$Group <- cut(
+    RNAranking$TPM_mean,
+    breaks = breaks,
+    include.lowest = TRUE,
+    right = TRUE,
+    labels = groups)
+  
+  corr$Group <- RNAranking$Group[
+    match(rownames(corr), rownames(RNAranking))]
+
+  corr <- corr[!is.na(corr$Group), ]
+  
+  corr_long <- corr %>%
+    pivot_longer(
+      cols = -c(Group, ID),
+      names_to = "sample",
+      values_to = "oxoG")
+
+  mean_across_gene <- corr_long %>%
+    group_by(sample, Group) %>%
+    summarise(
+      oxoG = mean(oxoG, na.rm = TRUE, trim = 0.01),
+      .groups = "drop")
+
+  mean_across_gene$Treatment <- sub("^[0-9]+_", "",mean_across_gene$sample)
+
+  summary_df <- mean_across_gene %>%
+    group_by(Group, Treatment) %>%
+    summarise(
+      mean_val = mean(oxoG, na.rm = TRUE),
+      se_val = sd(oxoG, na.rm = TRUE) / sqrt(n()),
+      .groups = "drop")
+
+  return(summary_df)
+}
+```
+
+### Create summary for oxoG around TSS
+
+```{r}
+create_summary_df <- function(results_list) {
+  summary_list <- list()
+  for (condition in conditions) {
+    for (strand_type in strand_types) {
+      key <- paste(condition, strand_type, sep = "_")
+      data <- results_list[[key]]
+      data$strand <- strand_type
+      data$group  <- condition
+      colnames(data) <- c(
+        "sample",
+        "counter",
+        "oxoG",
+        "strand",
+        "group")
+      summary_list[[key]] <- data
+    }
+  }
+
+  combined_data <- do.call(rbind, summary_list)
+  summary_df <- combined_data %>%
+    group_by(counter, strand, group) %>%
+    summarise(
+      mean_val = mean(oxoG, na.rm = TRUE),
+      se_val = sd(oxoG, na.rm = TRUE) / sqrt(n()),
+      .groups = "drop")
+
+  summary_df$Condition <- sub("\\_.*", "", summary_df$group)
+  summary_df$Period <- sub(".*\\_", "", summary_df$group)
+  return(list(
+    combined = combined_data,
+    summary = summary_df))
+}
+```
+
+### Gene length function
+```{r}
+process_assay_data <- function(oxi_obj, condition, expressed) {
+  keep <- rowData(oxi_obj)$gene_id %in% sub("\\..*", "", rownames(expressed))
+  df_trans <- data.frame(
+    oxoG = assay(oxi_obj, "oxoG_trans_level")[keep, grepl(condition, oxi_obj$sampleID)],
+    gene = rowData(oxi_obj)$gene_id[keep],
+    gene_length_label = factor(
+      rowData(oxi_obj)$gene_length_label[keep],
+      levels = c("<9Kb", "<23Kb", "<60Kb", ">=60Kb")),
+    counter = rowData(oxi_obj)$counter[keep])
+
+  df_nontrans <- data.frame(
+    oxoG = assay(oxi_obj, "oxoG_nontrans_level")[keep, grepl(condition, oxi_obj$sampleID)],
+    gene = rowData(oxi_obj)$gene_id[keep],
+    gene_length_label = factor(
+      rowData(oxi_obj)$gene_length_label[keep],
+      levels = c("<9Kb", "<23Kb", "<60Kb", ">=60Kb")),
+    counter = rowData(oxi_obj)$counter[keep])
+
+  df_trans_long <- df_trans %>%
+    pivot_longer(
+      cols = -c(gene, gene_length_label, counter),
+      names_to = "sample",
+      values_to = "value")
+
+  df_trans_long$sample <- sub(".*\\.", "", df_trans_long$sample)
+  df_trans_long$strand <- "Transcribed"
+
+  df_nontrans_long <- df_nontrans %>%
+    pivot_longer(
+      cols = -c(gene, gene_length_label, counter),
+      names_to = "sample",
+      values_to = "value")
+
+  df_nontrans_long$sample <- sub(".*\\.", "", df_nontrans_long$sample)
+  df_nontrans_long$strand <- "Non-transcribed"
+
+  df_allsample <- rbind(df_trans_long, df_nontrans_long)
+
+  summary_allsample <- df_allsample %>%
+    group_by(sample, counter, gene_length_label, strand) %>%
+    summarise(
+      mean_val = mean(value, na.rm = TRUE, trim = 0.05),
+      .groups = "drop")
+
+  summary <- summary_allsample %>%
+    group_by(counter, gene_length_label, strand) %>%
+    summarise(
+      oxoG = mean(mean_val, na.rm = TRUE),
+      se_val = sd(mean_val, na.rm = TRUE) / sqrt(n()),
+      .groups = "drop")
+
+  return(summary)
+}
+```
+
+
+### Process assay for expressed genes (TSS plot)
+```{r}
+process_assay_data_expr <- function(oxi_obj, strand, condition, gene_sets) {
+  # Extract data for the condition
+  if (strand == "Transcribed") {
+    tmp <- as.data.frame(
+      assay(oxi_obj, "oxoG_trans_level")[,
+        grepl(condition, oxi_obj$sampleID)])
+  } else {
+    tmp <- as.data.frame(
+      assay(oxi_obj, "oxoG_nontrans_level")[,
+        grepl(condition, oxi_obj$sampleID)])
+  }
+  tmp$gene <- rownames(tmp)
+  # Convert to long format
+  tmp_long <- tmp %>%
+    pivot_longer(
+      cols = -gene,
+      names_to = "sample",
+      values_to = "value")
+  # Create main dataframe
+  df <- data.frame(
+    gene    = sub("\\..*", "", tmp_long$gene),
+    sample  = tmp_long$sample,
+    level   = tmp_long$value,
+    strand  = strand,
+    counter = rep(rowData(oxi_obj)$counter, each = 5))
+
+  # Keep only expressed genes
+  gene_list <- sub("\\..*", "", rownames(gene_sets))
+  df_sub <- df[df$gene %in% gene_list, ]
+  results <- df_sub %>%
+    group_by(sample, counter) %>%
+    summarise(
+      mean_level = mean(level, na.rm = TRUE, trim = 0.01),
+      .groups = "drop")
+  return(results)
+}
+```
+
+## Gene length function
+```{r}
+process_assay_data <- function(oxi_obj, condition, gene_set) {
+  # Extract data for the condition
+  
+  df_trans <- data.frame(
+    oxoG = assay(oxi_obj, "oxoG_trans_level")[, grepl(condition, oxi_obj$sampleID)],
+    gene = rowData(oxi_obj)$gene_id,
+    gene_length_label = factor(rowData(oxi_obj)$gene_length_label, levels = c("<9Kb", "<23Kb","<60Kb",">=60Kb")),
+    counter = rowData(oxi_obj)$counter)
+  df_trans <- df_trans[which(df_trans$gene %in% sub("\\..*", "", rownames(gene_set))),]
+  df_nontrans <- data.frame(
+    oxoG = assay(oxi_obj, "oxoG_nontrans_level")[, grepl(condition, oxi_obj$sampleID)],
+    gene = rowData(oxi_obj)$gene_id,
+    gene_length_label = factor(rowData(oxi_obj)$gene_length_label, levels = c("<9Kb", "<23Kb","<60Kb",">=60Kb")),
+    counter = rowData(oxi_obj)$counter)
+  df_nontrans <-  df_nontrans[which(df_trans$gene %in% sub("\\..*", "", rownames(gene_set))),]
+  
+  df_trans_long <- df_trans %>%
+  pivot_longer(
+    cols = -c(gene,gene_length_label,counter),
+    names_to  = "sample",
+    values_to = "value" )
+  df_trans_long$sample <- sub(".*\\.", "", df_trans_long$sample)
+  df_trans_long$strand <- "Transcribed"
+  df_nontrans_long <- df_nontrans %>%
+    pivot_longer(
+      cols = -c(gene,gene_length_label,counter),
+      names_to  = "sample",
+      values_to = "value"
+      )
+  df_nontrans_long$sample <- sub(".*\\.", "", df_nontrans_long$sample)
+  df_nontrans_long$strand <- "Non-transcribed"
+  df_allsample <- rbind(df_trans_long, df_nontrans_long)
+
+  # average among genes
+  summary_allsample <- df_allsample %>%
+    group_by(sample, counter, gene_length_label, strand) %>%
+    summarise(mean_val = mean(value, na.rm = TRUE, trim = 0.05),.groups = "drop")
+  summary <- summary_allsample %>%
+  group_by(counter, gene_length_label, strand) %>%
+  summarise(
+    oxoG = mean(mean_val, na.rm = TRUE),
+    se_val = sd(mean_val, na.rm = TRUE) / sqrt(n()), 
+    .groups = "drop")
+  
+  return(summary)
+}
+```
+

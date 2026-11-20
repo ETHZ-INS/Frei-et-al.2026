@@ -1,0 +1,2084 @@
+---
+title: "20261001 OxoG_paper_plots"
+author: "Selina Frei"
+date: "2026-10-01"
+output: html_document
+---
+
+# Fig. 1
+## Fig. 1C
+
+```{r}
+US <- readRDS("objects/US_OFT_analyzed.rds")
+US$meta$condition[US$meta$condition == "CRS"] <- "Stress"
+```
+  
+```{r}
+x <- plot2D(us = US ,transitionmatrices =  "kmeans.100", colorby = "condition", color = c( "#A7BC9C","#D0A489"), plot.sem = T,seed = 1)+ggtitle("Overall Behavior")
+x
+svg("plots/Fig1/OFT_overall_Behavior.svg", width = 6, height = 5)
+print(x)
+dev.off()
+```
+
+## Fig. 1D 
+```{r}
+x <- PlotTransitionsStats(
+  us = US,
+  labels = "kmeans.100"
+)
+x
+svg("plots/Fig1/OFT_Histogram.svg", width = 6, height = 5)
+print(x)
+dev.off()
+```
+
+
+## Fig. 1H 
+```{r}
+se <- readRDS("objects/CRS2025_polyA_salmon.SE.analysed.rds")
+ctrl_genes <- readRDS("objects/CRS2025_Cycling_genes.rds")
+
+metadata(se)$anno_colors <- list(
+  Group = c(
+    "morning.Ctrl" = "#D1DEC8",
+    "evening.Ctrl" = "#7D9970",
+    "morning.CRS"  = "#E3CDB8",
+    "evening.CRS"  = "#BC7A5C"))
+
+hmcols <- c("#5D7290","#FAF7F2","#7A6A60")
+
+setSechmOption("hmcols",value = hmcols)
+
+group_order <- factor(
+  paste(
+    colData(se)$Period,
+    colData(se)$Condition,
+    sep = "."
+  ),
+  levels = c(
+    "morning.Ctrl",
+    "evening.Ctrl",
+    "morning.CRS",
+    "evening.CRS"))
+
+hm <- sechm(
+  se,
+  features = ctrl_genes,
+  assayName = "scaledLFC",
+  do.scale = FALSE,
+  gaps_at = c("Condition"),
+  column_order = colnames(se)[order(group_order)],
+  top_annotation = "Group",
+  show_rownames = FALSE,
+  name = "RNA (scaled)")
+
+svg("plots/Fig1/RNA_Hippocampus.svg", width = 7.5, height = 6)
+draw(hm)
+```
+
+
+## Fig. 1I
+```{r}
+amp_df <- readRDS("objects/RNA_amplifications.rds")
+fc_long <- rbind(
+  data.frame(
+    logFC = amp_df$CTRL_logFC,
+    Group = "Control"),
+  data.frame(
+    logFC = amp_df$CRS_logFC,
+    Group = "Stress"))
+
+density_plot <- ggplot(fc_long,
+  aes(
+    x = logFC,
+    colour = Group,
+    fill = Group)) +
+  geom_vline(
+    xintercept = 0,
+    linetype = 2,
+    colour = "black",
+    linewidth = 2.5) +
+  geom_density(alpha = 0.25, linewidth = 2 ) +
+  annotate("label",x = Inf,y = Inf,
+  label = paste0(
+    "Wilcoxon-Pratt\n",
+    "Z = 35.09\n",
+    "p < 1e-4"), hjust = 1.05,vjust = 1.1,size = 6, label.size = 0.8, fill = "white",color = "black", fontface = "bold", lineheight = 1.1)+
+  coord_cartesian(xlim = c(-0.5, 0.5)) +
+  scale_fill_manual(values = c(Control = "#7D9970",Stress = "#D0A489")) +
+  scale_color_manual(values = c(Control = "#7D9970", Stress = "#D0A489")) +
+  labs(x = "logFC (morning - evening)", y = "Density") +
+  theme_classic(base_size = 25) +
+  theme(axis.title = element_text(size = 35,face = "bold"), 
+    axis.text = element_text(size = 25, colour = "black"),
+    axis.line = element_line(linewidth = 2),
+    axis.ticks = element_line(linewidth = 2),
+    axis.ticks.length = unit(0.35, "cm"),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 25))
+
+density_plot
+ggsave("plots/Fig1/RNA_hippocampuslogFC_density.svg",density_plot, width = 8, height = 6)
+
+```
+
+# Fig. 2
+## Fig. 2A
+```{r}
+oxi_genebody <- readRDS("objects/hippocampus_oxoG_genebody_combined_analysed.rds")
+
+J_palette <- c("Ctrl_morning" = "#D1DEC8","Ctrl_evening" = "#7D9970")
+
+metadata(oxi_genebody)$anno_colors <- list(group = J_palette)
+
+tmp <- rowData(oxi_genebody)
+tmp_all <- tmp[order(tmp$FDR_all), ]
+
+sigGenes_genebody_all_AMvsPM <- rownames(tmp_all)[
+  which(!duplicated(tmp_all$gene_symbol) & tmp_all$DEA.all.Morning_vs_Evening$FDR < 0.05)]
+
+oxi_genebody_for_heatmap <- oxi_genebody
+# keep only controls
+oxi_genebody_for_heatmap <- oxi_genebody_for_heatmap[,oxi_genebody_for_heatmap$group %in% c("Ctrl_morning","Ctrl_evening")]
+
+# Remove Ensembl version numbers
+rownames(oxi_genebody_for_heatmap) <- sub("\\..*", "", rownames(oxi_genebody_for_heatmap))
+
+# Create mapping ENSG -> gene symbol
+gene_labels <- rowData(oxi_genebody_for_heatmap)$gene_symbol
+names(gene_labels) <- rownames(oxi_genebody_for_heatmap)
+
+# Replace rownames by gene symbols
+new_names <- gene_labels
+new_names[is.na(new_names) |new_names == ""] <- rownames(oxi_genebody_for_heatmap)[
+    is.na(new_names) | new_names == ""]
+
+rownames(oxi_genebody_for_heatmap) <- make.unique(new_names)
+colnames(oxi_genebody_for_heatmap) <- as.character(oxi_genebody_for_heatmap$group)
+
+features_all_AMvsPM_clean <- sub("\\..*", "",sigGenes_genebody_all_AMvsPM)
+features_all_AMvsPM_symbols <-gene_labels[features_all_AMvsPM_clean]
+features_all_AMvsPM_symbols <- features_all_AMvsPM_symbols[!is.na(features_all_AMvsPM_symbols)]
+
+hmcols <- c("#5D7290","#FAF7F2","#7A6A60")
+ht_opt(simple_anno_size = unit(20, "mm"))
+
+svg("plots/Fig2/Genebody_oxoG_Ctrl_AMvsPM.svg",width = 7.5,height = 6)
+
+mat <- assay(oxi_genebody_for_heatmap, "oxoG_all_level")
+mat <- t(scale(t(mat)))
+mat[mat > 1.5] <- 1.5
+mat[mat < -1.5] <- -1.5
+assay(oxi_genebody_for_heatmap, "oxoG_scaled") <- mat
+
+p <- draw(
+  sechm(
+    oxi_genebody_for_heatmap,
+    features_all_AMvsPM_symbols,
+    assayName = "oxoG_scaled",
+    hmcols = hmcols,
+    do.scale = FALSE,
+    top_annotation = "group",
+    show_rownames = FALSE,
+    show_colnames = FALSE,
+    column_title = "Gene body oxoG (AM vs PM)",
+    name = "oxoG level (scaled)"),
+  show_annotation_legend = FALSE)
+ht_opt(simple_anno_size = unit(5, "mm"))
+p
+```
+
+## Fig. 2B
+
+```{r}
+summary_df <- readRDS("objects/hippocampus_oxoG_quantile_transcribed.rds")
+summary_df <- summary_df %>% filter(Treatment %in% c("Ctrl_morning", "Ctrl_evening"))
+
+p <- ggplot(
+    summary_df,
+    aes(
+      x = Group,
+      y = mean_val,
+      color = Treatment,
+      linetype = Treatment,
+      shape = Treatment,
+      group = Treatment)) +
+    geom_point(size = 8) +
+    geom_line(linewidth = 2, position = position_dodge(width = 0.2), color = "black")+
+    geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val),
+      width = 0.15,
+      linewidth = 1.8,
+      linetype = "solid") +
+    scale_color_manual(values = c(Ctrl_morning = "#D1DEC8",Ctrl_evening = "#7D9970"),
+      name = "") +
+    scale_shape_manual(
+      values = c(Ctrl_morning = 16, Ctrl_evening = 16),name = "") +
+    scale_linetype_manual(
+      values = c(Ctrl_morning = "solid",Ctrl_evening = "solid"),name = "") +
+    labs(
+      x = "Gene expression tiers",
+      y = "Guanine oxidation (arb. unit)",
+      title = "DNA oxidation and global transcription",
+      subtitle = "Transcribed strand") +
+    theme_classic() +
+    coord_cartesian(ylim = c(0.85, 1.9)) +
+    scale_y_continuous(breaks = seq(0.85, 1.9, by = 0.25)) +
+    theme(
+      axis.title.x = element_text(size = 35, face = "bold"),
+      axis.title.y = element_text(size = 35, face = "bold"),
+      axis.text.x  = element_text(size = 25),
+      axis.text.y  = element_text(size = 25),
+      plot.title = element_text(size = 40, face = "bold"),
+      plot.subtitle = element_text(size = 35),
+      axis.line = element_line(linewidth = 1.8),
+      axis.ticks = element_line(linewidth = 1.8),
+      axis.ticks.length = unit(0.35, "cm"))
+p
+ggsave("plots/Fig2/hippocampus_transcribed_strand_expr.svg", p, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+
+## Fig. 2C
+```{r}
+summary_df <- readRDS("objects/hippocampus_oxoG_quantile_non_transcribed.rds")
+summary_df <- summary_df %>% filter(Treatment %in% c("Ctrl_morning", "Ctrl_evening"))
+
+p <- ggplot(
+    summary_df,
+    aes(
+      x = Group,
+      y = mean_val,
+      color = Treatment,
+      linetype = Treatment,
+      shape = Treatment,
+      group = Treatment)) +
+    geom_point(size = 8) +
+    geom_line(linewidth = 2, position = position_dodge(width = 0.2), color = "black")+
+    geom_errorbar(aes(ymin = mean_val - se_val, ymax = mean_val + se_val),
+      width = 0.15,
+      linewidth = 1.8,
+      linetype = "solid") +
+    scale_color_manual(values = c(Ctrl_morning = "#D1DEC8", Ctrl_evening = "#7D9970"),
+      name = "") +
+    scale_shape_manual(values = c(Ctrl_morning = 16,Ctrl_evening = 16),name = "") +
+    scale_linetype_manual(values = c(Ctrl_morning = "solid",Ctrl_evening = "solid"),
+      name = "") +
+    labs(
+      x = "Gene expression tiers",
+      y = "Guanine oxidation (arb. unit)",
+      title = "DNA oxidation and global transcription",
+      subtitle = "Non-transcribed strand") +
+    theme_classic() +
+    coord_cartesian(ylim = c(0.85, 1.9)) +
+    scale_y_continuous(breaks = seq(0.85, 1.9, by = 0.25)) +
+    theme(
+      axis.title.x = element_text(size = 35, face = "bold"),
+      axis.title.y = element_text(size = 35, face = "bold"),
+      axis.text.x  = element_text(size = 25),
+      axis.text.y  = element_text(size = 25),
+      plot.title = element_text(size = 40, face = "bold"),
+      plot.subtitle = element_text(size = 35),
+      axis.line = element_line(linewidth = 1.8),
+      axis.ticks = element_line(linewidth = 1.8),
+      axis.ticks.length = unit(0.35, "cm"))
+p
+ggsave("plots/Fig2/hippocampus_nontranscribed_strand_expr.svg", p, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+## Fig. 2D
+
+```{r}
+final_results_expressed <- readRDS("objects/hippocampus_oxoG_around_TSS_CTRL_results.rds")
+summary_df_allgene_expressed <- final_results_expressed$summary
+brks <- seq(0, 200, by = 25)
+labs <- rep("", length(brks))
+sel <- brks %in% c(0, 100, 200)
+labs[sel] <- c("-20Kb", "TSS", "+20Kb")
+
+condition_sep <- summary_df_allgene_expressed %>%
+  group_by(group, counter, strand) %>%
+  summarise(oxoG = mean(mean_val, na.rm = TRUE), se = mean(se_val, na.rm = TRUE),.groups = "drop")
+
+p_combined <- ggplot(
+  condition_sep,
+  aes(x = counter,y = oxoG,
+    colour = group,
+    fill = group,
+    linetype = strand,
+    group = interaction(group, strand))) +
+    #geom_point(size = 2) +
+    geom_line(position = position_dodge(width = 0.2), linewidth = 2.0) +
+    geom_ribbon(aes(ymin = oxoG - se, ymax = oxoG + se), alpha = 0.1, color = NA,position = position_dodge(width = 0.2))+
+scale_color_manual(values = c("Ctrl_morning" = "#D1DEC8","Ctrl_evening" = "#7D9970"),
+  name = "Group") +
+scale_fill_manual(values = c("Ctrl_morning" = "#D1DEC8","Ctrl_evening" = "#7D9970"),
+  name = "Group") +
+scale_linetype_manual(values = c("Transcribed" = "solid","Non-transcribed" = "22"),
+  name = "Strand")  +
+  ylim(c(0.4,1.8))+
+  scale_x_continuous(
+    limits = c(0, 210),
+    breaks = brks,
+    labels = labs,
+    expand = c(0, 0)) +
+  annotate("text", x = 35, y = 0.45, label = "bins=200b", hjust = 0.5, size = 10) +
+  coord_cartesian(clip = "off")+
+    labs(x = "", y = "Guanine oxidation (arb. unit)", title = "Guanine oxidation around TSS")+
+   theme_classic()+theme(
+    axis.title.x  = element_text(size = 35, face = "bold"),
+    axis.title.y  = element_text(size = 35, face = "bold"),
+    title  = element_text(size =40),
+    axis.text.x   = element_text(size = 25),
+    axis.text.y   = element_text(size = 25),
+    axis.line     = element_line(size = 1.8),
+    axis.ticks    = element_line(size = 1.8),
+    axis.ticks.length = unit(0.35, "cm"),
+    legend.key.width = unit(2, "lines"),
+    legend.text = element_text(size = 20),
+    legend.position = c(0.95, 0.05),legend.justification = c("right", "bottom"))
+p_combined
+ggsave("plots/Fig2/hippocampus_oxoG_around_TSS.svg", p_combined, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+## Fig. 2E
+
+```{r}
+ctrl_expressed <- readRDS("objects/hippocampus_oxoG_gene_length_CTRL.rds")
+
+p_ctrl_allexpressed <- ggplot(
+  ctrl_expressed,
+  aes(
+    x = counter,
+    y = oxoG,
+    color = strand,
+    fill = strand,
+    group = interaction(strand, gene_length_label))) +
+  geom_line(
+    aes(linetype = gene_length_label),
+    linewidth = 2.2,
+    position = position_dodge(width = 0.2)) +
+  geom_ribbon(
+    aes(ymin = oxoG - se_val, ymax = oxoG + se_val),
+    alpha = 0.15, color = NA,
+    position = position_dodge(width = 0.2)) +
+  scale_linetype_manual(
+    name = "Gene length",
+    values = c(
+      "<9Kb"   = "solid",
+      "<23Kb"  = "dashed",
+      "<60Kb"  = "dotted",
+      ">=60Kb" = "dotdash")) +
+  scale_color_manual(values = c(
+      "Transcribed" = "#A7BC9C",
+      "Non-transcribed" = "#7F7F7F")) +
+  scale_fill_manual(values = c(
+      "Transcribed" = "#A7BC9C",
+      "Non-transcribed" = "#7F7F7F")) +
+  scale_x_continuous(
+    breaks = c(1, 25, 50, 75, 100),
+    labels = c("-5Kb", "TSS", "50% gene", "TES", "+5Kb")) +
+  annotate("text", x = 13, y = -0.08,label = "upstream",size = 10) +
+  annotate("text", x = 13, y = -0.17, label = "bins = 200 bp",size = 10) +
+  annotate("text", x = 50, y = -0.12, label = "gene body\n(2% bins)",size = 10) +
+  annotate("text",x = 88, y = -0.08,label = "downstream",size = 10) +
+  annotate("text", x = 88, y = -0.17, label = "bins = 200 bp", size = 10) +
+  labs(
+    x = "",
+    y = "Guanine oxidation (arb. unit)",
+    title = "Guanine oxidation by gene length") +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x  = element_text(size = 25),
+    axis.text.y  = element_text(size = 25),
+    plot.title = element_text(size = 40),
+    legend.title = element_text(size = 25),
+    legend.text = element_text(size = 20),
+    legend.key.width = unit(3, "lines"),
+    axis.line = element_line(linewidth = 1.8),
+    axis.ticks = element_line(linewidth = 1.8),
+    axis.ticks.length = unit(0.35, "cm"))
+p_ctrl_allexpressed
+ggsave("plots/Fig2/hippocampus_oxoG_gene_length.svg", p_ctrl_allexpressed, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+
+## Fig. 2F
+```{r}
+dinuc <- readRDS("objects/hippocampus_dinuc_summary_satellite.rds")
+dinuc_long <- dinuc  %>% pivot_longer(
+    cols = c(ApG, TpG, CpG, GpG), names_to = "dinucleotide", values_to = "oxoG_level")
+
+# Keep only control samples
+dinuc_summary_ctrl <- dinuc_long %>% dplyr::filter(
+    Treatment %in% c("Ctrl_morning","Ctrl_evening")) %>%
+  group_by(dinucleotide, Treatment) %>%
+  summarise(
+    mean = mean(oxoG_level, na.rm = TRUE),
+    sd   = sd(oxoG_level, na.rm = TRUE),
+    se   = sd / sqrt(n()),.groups = "drop")
+
+# Order dinucleotides
+dinuc_summary_ctrl$dinucleotide <- factor(dinuc_summary_ctrl$dinucleotide, levels = c("ApG", "TpG", "CpG", "GpG"))
+
+# Plot
+p_dinuc_ctrl <- ggplot(
+  dinuc_summary_ctrl,
+  aes(
+    x = dinucleotide,
+    y = mean,
+    color = Treatment,
+    group = Treatment)) +
+  geom_linerange(aes(
+      ymin = mean - se,
+      ymax = mean + se),
+    width = 0.05,
+    linewidth = 3) +
+  geom_line(linewidth = 2.5, color = "black") +
+  geom_point(size = 15) +
+  scale_color_manual(
+    values = c(
+      "Ctrl_morning" = "#D1DEC8",
+      "Ctrl_evening" = "#7D9970")) +
+  labs(
+    x = "Dinucleotides with oxidized G at 2nd pos",
+    y = expression("Guanine oxidation (arb. unit)"))  +
+  theme_classic(base_size = 18) +
+  theme(
+    axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x = element_text(size = 25,color = "black"),
+    axis.text.y = element_text(size = 25,color = "black"),
+    axis.line = element_line(linewidth = 1.8),
+    axis.ticks = element_line(linewidth = 1.8),
+    legend.position = "none") +
+
+scale_y_continuous(limits = c(0,4), breaks = seq(0,4, by = 1))
+p_dinuc_ctrl
+ggsave("plots/Fig2/hippocampus_dinuc_analysis_satellite.svg", p_dinuc_ctrl, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+
+## Fig. 2G
+
+```{r}
+dinuc <- readRDS("objects/embryo_dinuc_summary_satellite.rds")
+dinuc_long <- dinuc  %>% pivot_longer(
+    cols = c(ApG, TpG, CpG, GpG),
+    names_to = "dinucleotide",
+    values_to = "oxoG_level")
+
+dinuc_summary <- dinuc_long %>%
+  dplyr::filter(group == "wt") %>%
+  group_by(dinucleotide) %>%
+  summarise(
+    mean = mean(oxoG_level),
+    sd   = sd(oxoG_level),
+    se   = sd / sqrt(n()),
+    .groups = "drop" )
+dinuc_summary$dinucleotide <- factor(dinuc_summary$dinucleotide, levels = c("ApG", "TpG", "CpG", "GpG"))
+
+# WT only summary
+dinuc_summary_wt <- dinuc_long %>%
+  dplyr::filter(group == "wt") %>%
+  group_by(dinucleotide) %>%
+  summarise(
+    mean = mean(oxoG_level),
+    sd   = sd(oxoG_level),
+    se   = sd / sqrt(n()),.groups = "drop")
+
+dinuc_summary_wt$dinucleotide <- factor(dinuc_summary_wt$dinucleotide,
+  levels = c("ApG", "TpG", "CpG", "GpG"))
+
+p_dinuc_wt <- ggplot(
+  dinuc_summary_wt,
+  aes(x = dinucleotide, y = mean, group = 1)) +
+  geom_linerange(
+    aes(ymin = mean - se,
+        ymax = mean + se),
+    width = 0.05,
+    linewidth = 3,
+    color = "#A7BC9C") +
+  geom_line(linewidth = 2.5, color = "black") +
+  geom_point(size = 15, color = "#A7BC9C") +
+  labs(
+    x = "Dinucleotides with oxidized G at 2nd pos",
+    y = expression("Guanine oxidation (arb. unit)")) +
+  theme_classic(base_size = 18) +
+  theme(
+ axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x = element_text(size = 25,color = "black"),
+    axis.text.y = element_text(size = 25,color = "black"),
+    axis.line = element_line(linewidth = 1.8),
+    axis.ticks = element_line(linewidth = 1.8),
+    legend.position = "none") +
+scale_y_continuous(limits = c(0, 4),breaks = seq(0, 4, by = 1))
+p_dinuc_wt
+ggsave("plots/Fig2/embryo_dinuc_analysis_satellite.svg", p_dinuc_wt, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+
+
+## Fig. 2H
+```{r}
+meth_agg <- readRDS("objects/hipppocampus_oxoG_methylation.rds")
+df <- as.data.frame(
+  cbind(
+    methyl_label = rowData(meth_agg)[,"methyl_label"],
+    oxoG = rowData(meth_agg)[,"oxoG_counts"]
+  )
+)
+
+df_long <- df %>% pivot_longer(
+  cols = c(-methyl_label),
+  values_to = "oxoG",
+  names_to = "sample")
+df_long$sample <- sub("^oxoG\\.", "", df_long$sample)
+mean_across_sites <- df_long %>%
+  dplyr::group_by(methyl_label, sample) %>%
+  dplyr::summarise(
+    mean_val = mean(as.numeric(oxoG), na.rm = TRUE),
+    .groups = "drop"
+  )
+mean_across_sites$condition <- sub("^[0-9]+_", "", mean_across_sites$sample)
+
+mean_across_sites_ctrl <- mean_across_sites %>%
+  dplyr::filter(grepl("^Ctrl", condition))
+
+summary_df <- mean_across_sites_ctrl %>%
+  dplyr::group_by(methyl_label) %>%
+  dplyr::summarise(
+    mean_oxoG = mean(mean_val, na.rm = TRUE),
+    se_val = sd(mean_val, na.rm = TRUE) / sqrt(dplyr::n()),
+    .groups = "drop"
+  )
+
+summary_df$methyl_label <- factor(
+  summary_df$methyl_label,
+  levels = c("No", "Medium", "High"))
+mean_across_sites_ctrl$methyl_label <- factor(
+  mean_across_sites_ctrl$methyl_label,
+  levels = c("No", "Medium", "High"))
+
+p_plot <- ggplot(
+  summary_df,
+  aes(
+    x = methyl_label,
+    y = mean_oxoG,
+    color = methyl_label)) +
+  geom_point(size = 15) +
+  geom_errorbar(
+    aes(
+      ymin = mean_oxoG - se_val,
+      ymax = mean_oxoG + se_val),
+    width = 0.35,
+    linewidth = 2.0) +
+  scale_color_manual(
+    values = c(
+  "No"     = "#D9D9D9",
+  "Medium" = "#8CBFD6",
+  "High"   = "#3F6F8C"
+)) +
+  labs(
+    x = "CpG methylation level",
+    y = "Guanine oxidation level (arb. unit)",
+    color = "Methylation") +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x  = element_text(size = 25),
+    axis.text.y  = element_text(size = 25),
+    legend.title = element_text(size = 35),
+    legend.text  = element_text(size = 33),
+    axis.line = element_line(linewidth = 2),
+    axis.ticks = element_line(linewidth = 2),
+    axis.ticks.length = unit(0.35, "cm"))
+p_plot
+ggsave("plots/Fig2/hippocampus_oxoG_methylation.svg", p_plot, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+## Fig. 2I
+
+```{r}
+meth <- readRDS("objects/embryonic_bsobj_cpg.rds")
+oxog <- readRDS("objects/embryonic_meth_oxoG_cpg.rds")
+df <- data.frame(methyl_label = rowData(meth)$methyl_label,assay(oxog, "oxoG_counts"))
+
+df_long <- df %>%
+  pivot_longer(
+    cols = -methyl_label,
+    values_to = "oxoG",
+    names_to = "sample")
+
+df_long$sample <- sub("^oxoG\\.", "", df_long$sample)
+
+mean_across_sites <- df_long %>%
+  group_by(methyl_label, sample) %>%
+  summarise(
+    mean_val = mean(oxoG, na.rm = TRUE),.groups = "drop")
+
+mean_across_sites$condition <- sub("^[0-9]+_","",mean_across_sites$sample)
+
+mean_across_sites_WT <- mean_across_sites %>% dplyr::filter(sample %in% c("DE02", "DE03", "DE04"))
+
+summary_df <- mean_across_sites_WT %>%
+  group_by(methyl_label) %>%
+  summarise(
+    mean_oxoG = mean(mean_val, na.rm = TRUE),
+    se_val = sd(mean_val, na.rm = TRUE) / sqrt(n()), .groups = "drop")
+
+summary_df$methyl_label <- factor(summary_df$methyl_label,levels = c("No", "Medium", "High"))
+
+mean_across_sites_WT$methyl_label <- factor(mean_across_sites_WT$methyl_label, levels = c("No", "Medium", "High"))
+
+p_plot <- ggplot(
+  summary_df,
+  aes(
+    x = methyl_label,
+    y = mean_oxoG,
+    color = methyl_label)) +
+  geom_point(size = 15) +
+  geom_errorbar(
+    aes(
+      ymin = mean_oxoG - se_val,
+      ymax = mean_oxoG + se_val),
+    width = 0.35,
+    linewidth = 2.0) +
+  scale_color_manual(values = c(
+  "No"     = "#D9D9D9",
+  "Medium" = "#8CBFD6",
+  "High"   = "#3F6F8C"
+)) +
+  labs(
+    x = "CpG methylation level",
+    y = "Guanine oxidation level (arb. unit)",
+    color = "Methylation") +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x  = element_text(size = 25),
+    axis.text.y  = element_text(size = 25),
+    legend.title = element_text(size = 35),
+    legend.text  = element_text(size = 33),
+    axis.line = element_line(linewidth = 2),
+    axis.ticks = element_line(linewidth = 2),
+    axis.ticks.length = unit(0.35, "cm"))
+p_plot
+ggsave("plots/Fig2/embryo_oxoG_methylation.svg", p_plot, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+# Fig. 3
+
+## Fig. 3A
+
+
+```{r}
+summary_df <- readRDS("objects/hippocampus_oxoG_quantile_transcribed.rds")
+
+p <- ggplot(
+    summary_df,
+    aes(x = Group, y = mean_val, color = Treatment,linetype = Treatment,shape = Treatment, group = Treatment)) +
+     geom_point(size = 8) +
+    geom_line(
+      linewidth = 2,
+      position = position_dodge(width = 0.2), color = "black") +
+    geom_errorbar(
+      aes(
+        ymin = mean_val - se_val,
+        ymax = mean_val + se_val),
+      width = 0.15,
+      linewidth = 1.8,
+      linetype = "solid") +
+    scale_color_manual(
+      values = c(
+        CRS_morning = "#E3CDB8",
+        Ctrl_morning = "#D1DEC8",
+        CRS_evening = "#BC7A5C",
+        Ctrl_evening = "#7D9970"),
+      name = "") +
+scale_shape_manual(values = c("CRS_morning" = "circle", "Ctrl_morning" = "circle",
+"CRS_evening" = "circle","Ctrl_evening" = "circle"), name = "") +
+      scale_linetype_manual(values = c("CRS_morning" = "dotted", "Ctrl_morning" = "solid", "CRS_evening" = "dotted","Ctrl_evening" = "solid"), name = "") +
+   labs(
+      x = "Gene expression tiers",
+      y = "Guanine oxidation (arb. unit)",
+      title = "DNA oxidation and global transcription",
+      subtitle = "Transcribed strand") +
+    theme_classic() +
+    coord_cartesian(ylim = c(0.85, 1.9)) +
+    scale_y_continuous(breaks = seq(0.85, 1.9, by = 0.25)) +
+    theme(
+      axis.title.x = element_text(size = 35, face = "bold"),
+      axis.title.y = element_text(size = 35, face = "bold"),
+      axis.text.x  = element_text(size = 25),
+      axis.text.y  = element_text(size = 25),
+      plot.title = element_text(size = 40, face = "bold"),
+      plot.subtitle = element_text(size = 35),
+      axis.line = element_line(linewidth = 1.8),
+      axis.ticks = element_line(linewidth = 1.8),
+      axis.ticks.length = unit(0.35, "cm"))
+p
+ggsave("plots/Fig3/transcribed_strand_expr.svg", p, width = 14, height = 10, dpi = 600, units = "in")
+
+```
+
+
+## Fig. 3B
+```{r}
+summary_df <- readRDS("objects/hippocampus_oxoG_quantile_non_transcribed.rds")
+
+p <- ggplot(
+    summary_df,
+    aes(x = Group, y = mean_val, color = Treatment,linetype = Treatment,shape = Treatment, group = Treatment)) +
+     geom_point(size = 8) +
+    geom_line(
+      linewidth = 2,
+      position = position_dodge(width = 0.2), color = "black") +
+    geom_errorbar(
+      aes(
+        ymin = mean_val - se_val,
+        ymax = mean_val + se_val),
+      width = 0.15,
+      linewidth = 1.8,
+      linetype = "solid") +
+    scale_color_manual(
+      values = c(
+        CRS_morning = "#E3CDB8",
+        Ctrl_morning = "#D1DEC8",
+        CRS_evening = "#BC7A5C",
+        Ctrl_evening = "#7D9970"),
+      name = "") +
+scale_shape_manual(values = c("CRS_morning" = "circle", "Ctrl_morning" = "circle",
+"CRS_evening" = "circle","Ctrl_evening" = "circle"), name = "")+
+      scale_linetype_manual(values = c("CRS_morning" = "dotted", "Ctrl_morning" = "solid","CRS_evening" = "dotted","Ctrl_evening" = "solid"), name = "") +
+labs(
+      x = "Gene expression tiers",
+      y = "Guanine oxidation (arb. unit)",
+      title = "DNA oxidation and global transcription",
+      subtitle = "Non-transcribed strand") +
+    theme_classic() +
+    coord_cartesian(ylim = c(0.85, 1.9)) +
+    scale_y_continuous(breaks = seq(0.85, 1.9, by = 0.25)) +
+    theme(
+      axis.title.x = element_text(size = 35, face = "bold"),
+      axis.title.y = element_text(size = 35, face = "bold"),
+      axis.text.x  = element_text(size = 25),
+      axis.text.y  = element_text(size = 25),
+      plot.title = element_text(size = 40, face = "bold"),
+      plot.subtitle = element_text(size = 35),
+      axis.line = element_line(linewidth = 1.8),
+      axis.ticks = element_line(linewidth = 1.8),
+      axis.ticks.length = unit(0.35, "cm"))
+p
+ggsave("plots/Fig3/non_transcribed_strand_expr.svg", p, width = 14, height = 10, dpi = 600, units = "in")
+
+```
+
+## Fig. 3C
+```{r}
+## Load data
+oxi_promoter <- readRDS("objects/hippocampus_oxoG_promoter_analysed.rds")
+oxi_promoter <- oxi_promoter[, order(oxi_promoter$group)]
+
+## Colors
+J_palette <- c(
+  "Ctrl_morning" = "#D1DEC8",
+  "Ctrl_evening" = "#7D9970",
+  "CRS_morning"  = "#E3CDB8",
+  "CRS_evening"  = "#BC7A5C")
+
+metadata(oxi_promoter)$anno_colors <- list(group = J_palette)
+
+## Prepare object for heatmap
+oxi_promoter_for_heatmap <- oxi_promoter
+
+## Remove Ensembl version numbers
+rownames(oxi_promoter_for_heatmap) <- sub("\\..*", "", rownames(oxi_promoter_for_heatmap))
+
+## Replace rownames with gene symbols
+gene_symbols <- rowData(oxi_promoter_for_heatmap)$gene_symbol
+
+rownames(oxi_promoter_for_heatmap) <- make.unique(ifelse(is.na(gene_symbols) | gene_symbols == "", rownames(oxi_promoter_for_heatmap), gene_symbols))
+
+## Sample labels
+colnames(oxi_promoter_for_heatmap) <- as.character(oxi_promoter_for_heatmap$group)
+
+## Select all AM vs PM significant genes
+features_trans_AMvsPM_symbols <- unique(rowData(oxi_promoter)$gene_symbol[rowData(oxi_promoter)$DEA.trans.Morning_vs_Evening$FDR < 0.05])
+
+features_trans_AMvsPM_symbols <- features_trans_AMvsPM_symbols[!is.na(features_trans_AMvsPM_symbols) & features_trans_AMvsPM_symbols != ""]
+
+## Heatmap colors
+hmcols <- c("#5D7290", "#FAF7F2", "#7A6A60")
+
+ht_opt(simple_anno_size = unit(20, "mm"))
+
+svg("plots/Fig3/Promoter_oxoG_brain.svg", width = 7.5, height = 6)
+
+draw(
+  sechm(
+    oxi_promoter_for_heatmap,
+    features_trans_AMvsPM_symbols,
+    show_rownames = FALSE,
+    assayName = "oxoG_trans_level",
+    hmcols = hmcols,
+    do.scale = TRUE,
+    top_annotation = "group",
+    column_title = "Promoter oxoG Transcribed Strand (AM vs PM)",
+    name = "oxoG level (scaled)"))
+
+dev.off()
+ht_opt(simple_anno_size = unit(5, "mm"))
+```
+
+
+## Fig. 3D
+```{r}
+genes <- readRDS("objects/CRS2025_CTRL_Cycling_genes.rds")
+se <- readRDS("objects/CRS2025_polyA_salmon.SE.analysed.rds")
+oxi_promoter <- readRDS("objects/hippocampus_oxoG_promoter.rds")
+heatmap_genes <- intersect(genes,rownames(oxi_promoter))
+heatmap_genes <- intersect(heatmap_genes,rownames(se))
+
+J_palette <- c(
+  "Ctrl_morning" = "#D1DEC8",
+  "Ctrl_evening" = "#7D9970",
+  "CRS_morning"  = "#E3CDB8",
+  "CRS_evening"  = "#BC7A5C")
+
+oxi_promoter$condition <- factor(oxi_promoter$condition,levels = c("Ctrl", "CRS"))
+oxi_promoter$period <- factor(oxi_promoter$period,levels = c("morning", "evening"))
+oxi_promoter$Group <- paste(oxi_promoter$condition,oxi_promoter$period,sep = "_")
+metadata(oxi_promoter)$anno_colors <- list(Group = J_palette)
+ord_oxo <- order(oxi_promoter$condition, oxi_promoter$period)
+oxi_promoter <- oxi_promoter[, ord_oxo]
+se$Condition <- factor(se$Condition,levels = c("Ctrl", "CRS"))
+se$Period <- factor(se$Period,levels = c("morning", "evening"))
+se$Group <- paste(se$Condition,se$Period,sep = "_")
+metadata(se)$anno_colors <- list(Group = J_palette)
+ord_rna <- order(se$Condition, se$Period)
+se <- se[, ord_rna]
+rownames(oxi_promoter) <- sub(".*\\.", "", rownames(oxi_promoter))
+rownames(se) <- sub(".*\\.", "", rownames(se))
+heatmap_genes_symbols <- sub(".*\\.", "", heatmap_genes)
+rna_mat <- assay(se, "log2FC")[heatmap_genes_symbols, ]
+cor_mat <- cor(t(rna_mat),method = "pearson", use = "pairwise.complete.obs")
+ord <- hclust(as.dist(1 - cor(t(rna_mat))), method = "average")$order
+genes_ord <- rownames(rna_mat)[ord]
+hmcols <- c("#5D7290", "#FAF7F2", "#7A6A60")
+
+## Heatmap
+svg("plots/Fig3/Promoter_oxoG_RNA_sig_oxoG.svg", width = 7.5, height = 6)
+
+draw(
+  sechm(
+    oxi_promoter,
+    genes_ord,
+    assayName = "oxoG_trans_level",
+    do.scale = TRUE,
+    cluster_rows = FALSE,
+    hmcols = hmcols,
+    top_annotation = "Group",
+    column_title = "Promoter oxoG transcribed strand",
+    name = "oxoG level (scaled)") +
+
+  sechm(
+    se,
+    genes_ord,
+    assayName = "scaledLFC",
+    do.scale = FALSE,
+    cluster_rows = FALSE,
+    hmcols = hmcols,
+    top_annotation = "Group",
+    show_rownames = FALSE,
+    column_title = "RNA (scaledLFC)",
+    name = "scaledLFC"),
+  merge_legend = FALSE,
+  gap = unit(2, "mm"))
+
+dev.off()
+```
+
+
+## Fig. 3E
+```{r}
+dinuc <- readRDS("objects/hippocampus_dinuc_summary_satellite.rds")
+dinuc_long <- dinuc  %>% pivot_longer(
+    cols = c(ApG, TpG, CpG, GpG),
+    names_to = "dinucleotide",
+    values_to = "oxoG_level")
+
+
+# Keep only control samples
+dinuc_summary_all <- dinuc_long %>%
+  dplyr::filter(
+    Treatment %in% c(
+      "Ctrl_morning",
+      "Ctrl_evening", "CRS_morning", "CRS_evening")) %>%
+  group_by(dinucleotide, Treatment) %>%
+  summarise(
+    mean = mean(oxoG_level, na.rm = TRUE),
+    sd   = sd(oxoG_level, na.rm = TRUE),
+    se   = sd / sqrt(n()),
+    .groups = "drop")
+
+# Order dinucleotides
+dinuc_summary_all$dinucleotide <- factor(dinuc_summary_all$dinucleotide,
+  levels = c("ApG", "TpG", "CpG", "GpG"))
+
+# Plot
+p_dinuc_all <- ggplot(
+  dinuc_summary_all,
+  aes(
+    x = dinucleotide,
+    y = mean,
+    color = Treatment,
+    group = Treatment)) +
+  geom_linerange(
+    aes(
+      ymin = mean - se,
+      ymax = mean + se),
+    width = 0.05,
+    linewidth = 3) +
+  geom_line(linewidth = 2.5, color = "black") +
+  geom_point(size = 15) +
+  scale_color_manual(
+    values = c("Ctrl_morning" = "#D1DEC8", "Ctrl_evening" = "#7D9970", "CRS_morning" = "#E3CDB8", "CRS_evening" = "#BC7A5C")) +
+  labs(
+    x = "Dinucleotides with oxidized G at 2nd pos",
+    y = expression("Guanine oxidation (arb. unit)"))  +
+  theme_classic(base_size = 18) +
+  theme(
+    axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x = element_text(size = 25, color = "black"),
+    axis.text.y = element_text(size = 25, color = "black"),
+    axis.line = element_line(linewidth = 1.8),
+    axis.ticks = element_line(linewidth = 1.8),
+    legend.position = "none") +
+
+scale_y_continuous(limits = c(0,4), breaks = seq(0,4, by = 1))
+
+p_dinuc_all
+ggsave("plots/Fig3/hippocampus_dinuc_analysis_satellite_CRS.svg", p_dinuc_all, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+
+# Supplementary Figures
+
+## Suppl. Fig. 1C
+```{r}
+amp_df <- readRDS("objects/RNA_amplifications.rds")
+fc_long <- rbind(
+  data.frame(
+    logFC = amp_df$CTRL_logFC,
+    Group = "Control"),
+  data.frame(
+    logFC = amp_df$CRS_logFC,
+    Group = "Stress"))
+
+ecdf_plot <- ggplot(fc_long, aes(x = logFC, colour = Group)) +
+
+  stat_ecdf(linewidth = 2.5) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "black", linewidth = 2) +
+  coord_cartesian(xlim = c(-0.35, 0.35)) +
+  scale_color_manual(values = c(Control = "#7D9970", Stress = "#D0A489")) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(x = "logFC (morning - evening)", y = "Cumulative fraction") +
+  theme_classic(base_size = 25) +
+  theme(
+    axis.title = element_text(size = 35, face = "bold"),
+    axis.text = element_text(size = 25, colour = "black"),
+    axis.line = element_line(linewidth = 2),
+    axis.ticks = element_line(linewidth = 2),
+    axis.ticks.length = unit(0.35, "cm"),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 25))
+ecdf_plot
+
+ggsave("plots/Supplementary/RNA_logFC_ecdf.svg", ecdf_plot, width = 8, height = 6)
+```
+
+
+## Suppl. Fig. 2A
+```{r}
+dinuc <- readRDS("objects/hippocampus_dinuc_summary.rds")
+dinuc_long <- dinuc  %>% pivot_longer(
+    cols = c(ApG, TpG, CpG, GpG),
+    names_to = "dinucleotide",
+    values_to = "oxoG_level")
+
+# Keep only control samples
+dinuc_summary_ctrl <- dinuc_long %>% dplyr::filter(
+    Treatment %in% c(
+      "Ctrl_morning",
+      "Ctrl_evening")) %>%
+  group_by(dinucleotide, Treatment) %>%
+  summarise(
+    mean = mean(oxoG_level, na.rm = TRUE),
+    sd   = sd(oxoG_level, na.rm = TRUE),
+    se   = sd / sqrt(n()),.groups = "drop")
+
+# Order dinucleotides
+dinuc_summary_ctrl$dinucleotide <- factor(dinuc_summary_ctrl$dinucleotide,
+  levels = c("ApG", "TpG", "CpG", "GpG"))
+
+# Plot
+p_dinuc_ctrl <- ggplot(
+  dinuc_summary_ctrl,
+  aes(
+    x = dinucleotide,
+    y = mean,
+    color = Treatment,
+    group = Treatment)) +
+  geom_linerange(
+    aes(
+      ymin = mean - se,
+      ymax = mean + se),
+    width = 0.05,
+    linewidth = 3) +
+  geom_line(linewidth = 2.5, color = "black") +
+  geom_point(size = 15) +
+  scale_color_manual(
+    values = c("Ctrl_morning" = "#D1DEC8", "Ctrl_evening" = "#7D9970") ) +
+  labs(
+    x = "Dinucleotides with oxidized G at 2nd pos",
+    y = expression("Guanine oxidation (arbitrary unit)")) +
+  theme_classic(base_size = 18) +
+  theme(
+    axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x = element_text(size = 25, color = "black"),
+    axis.text.y = element_text(size = 25, color = "black"),
+    axis.line = element_line(linewidth = 1.8),
+    axis.ticks = element_line(linewidth = 1.8),
+    legend.position = "none") +
+scale_y_continuous(limits = c(1.0,2.0), breaks = seq(1.0,2.0, by = 0.5))
+p_dinuc_ctrl
+ggsave("plots/Supplementary/hippocampus_dinuc_analysis.svg", p_dinuc_ctrl, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+## Suppl. Fig. 2B
+```{r}
+dinuc <- readRDS("objects/embryo_dinuc_summary.rds")
+dinuc_long <- dinuc  %>% pivot_longer(
+    cols = c(ApG, TpG, CpG, GpG),
+    names_to = "dinucleotide",
+    values_to = "oxoG_level")
+
+dinuc_summary <- dinuc_long %>%
+  dplyr::filter(group == "wt") %>%
+  group_by(dinucleotide) %>%
+  summarise(
+    mean = mean(oxoG_level),
+    sd   = sd(oxoG_level),
+    se   = sd / sqrt(n()),
+    .groups = "drop" )
+dinuc_summary$dinucleotide <- factor(dinuc_summary$dinucleotide, levels = c("ApG", "TpG", "CpG", "GpG"))
+
+# WT only summary
+dinuc_summary_wt <- dinuc_long %>%
+  dplyr::filter(group == "wt") %>%
+  group_by(dinucleotide) %>%
+  summarise(
+    mean = mean(oxoG_level),
+    sd   = sd(oxoG_level),
+    se   = sd / sqrt(n()),.groups = "drop")
+
+dinuc_summary_wt$dinucleotide <- factor(dinuc_summary_wt$dinucleotide,
+  levels = c("ApG", "TpG", "CpG", "GpG"))
+
+p_dinuc_wt <- ggplot(
+  dinuc_summary_wt,
+  aes(x = dinucleotide, y = mean, group = 1)) +
+  geom_linerange(
+    aes(ymin = mean - se,
+        ymax = mean + se),
+    width = 0.05,
+    linewidth = 3,
+    color = "#A7BC9C") +
+  geom_line(linewidth = 2.5, color = "black") +
+  geom_point(size = 15, color = "#A7BC9C") +
+  labs(
+    x = "Dinucleotides with oxidized G at 2nd pos",
+    y = expression("Guanine oxidation (arb. unit)")) +
+  theme_classic(base_size = 18) +
+  theme(
+ axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x = element_text(size = 25,color = "black"),
+    axis.text.y = element_text(size = 25,color = "black"),
+    axis.line = element_line(linewidth = 1.8),
+    axis.ticks = element_line(linewidth = 1.8),
+    legend.position = "none") +
+scale_y_continuous(limits = c(0.65, 1.7),breaks = seq(0, 1.6, by = 0.2))
+p_dinuc_wt
+ggsave("plots/Supplementary/embryo_dinuc_analysis.svg", p_dinuc_wt, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+## Suppl. Fig. 3A
+
+```{r}
+## Load data
+oxi_genebody <- readRDS("objects/hippocampus_oxoG_genebody_analysed.rds")
+oxi_genebody <- oxi_genebody[, order(oxi_genebody$group)]
+
+## Colors
+J_palette <- c(
+  "Ctrl_morning" = "#D1DEC8",
+  "Ctrl_evening" = "#7D9970",
+  "CRS_morning"  = "#E3CDB8",
+  "CRS_evening"  = "#BC7A5C"
+)
+
+metadata(oxi_genebody)$anno_colors <- list(group = J_palette)
+
+## Create heatmap object
+oxi_genebody_for_heatmap <- oxi_genebody
+
+## Remove Ensembl version numbers
+rownames(oxi_genebody_for_heatmap) <-
+  sub("\\..*", "", rownames(oxi_genebody_for_heatmap))
+
+## ENSG -> gene symbol mapping
+gene_labels <- rowData(oxi_genebody_for_heatmap)$gene_symbol
+names(gene_labels) <- rownames(oxi_genebody_for_heatmap)
+
+## Replace rownames with gene symbols
+new_names <- gene_labels
+new_names[is.na(new_names) | new_names == ""] <-
+  rownames(oxi_genebody_for_heatmap)[is.na(new_names) | new_names == ""]
+
+rownames(oxi_genebody_for_heatmap) <- make.unique(new_names)
+
+## Sample names
+colnames(oxi_genebody_for_heatmap) <-
+  as.character(oxi_genebody_for_heatmap$group)
+
+## Select all significant Morning vs Evening genes
+features_trans_AMvsPM_symbols <-
+  unique(
+    rowData(oxi_genebody)$gene_symbol[
+      rowData(oxi_genebody)$DEA.trans.Morning_vs_Evening$FDR < 0.05
+    ]
+  )
+
+features_trans_AMvsPM_symbols <-
+  features_trans_AMvsPM_symbols[
+    !is.na(features_trans_AMvsPM_symbols) &
+      features_trans_AMvsPM_symbols != ""
+  ]
+
+## Heatmap colors
+hmcols <- c("#5D7290", "#FAF7F2", "#7A6A60")
+
+ht_opt(simple_anno_size = unit(20, "mm"))
+svg("plots/Supplementary/Genebody_oxoG_brain.svg", width = 7.5, height = 6)
+
+draw(
+  sechm(
+    oxi_genebody_for_heatmap,
+    features_trans_AMvsPM_symbols,
+    show_rownames = FALSE,
+    assayName = "oxoG_trans_level",
+    hmcols = hmcols,
+    do.scale = TRUE,
+    top_annotation = "group",
+    column_title = "Genebody oxoG Transcribed Strand (AM vs PM)",
+    name = "oxoG level (scaled)"
+  )
+)
+
+dev.off()
+
+ht_opt(simple_anno_size = unit(5, "mm"))
+```
+
+
+## Suppl. Fig. 3C
+```{r}
+genes <- readRDS("objects/CRS2025_CTRL_Cycling_genes.rds")
+RNA <- readRDS("objects/CRS2025_polyA_salmon.SE.analysed.rds")
+oxoG_promoter <- readRDS("objects/hippocampus_oxoG_promoter.rds")
+RNA$group <- paste0(RNA$Condition,"_",RNA$Period)
+oxoG_promoter$group <- paste0( oxoG_promoter$condition,"_",oxoG_promoter$period)
+rownames(RNA) <- sub("^([^.]+)\\.(.+)$","\\2.\\1",rownames(RNA))
+
+parts <- strsplit(rownames(RNA), "\\.")
+
+rownames(RNA) <- sapply(parts,
+  function(x)
+    paste(x[2], x[1], sep = "."))
+
+heatmap_genes <- intersect(genes,rownames(oxoG_promoter))
+
+heatmap_genes <- intersect(heatmap_genes,rownames(RNA))
+
+oxoG_mean <- rowMeans(assay(oxoG_promoter,"oxoG_trans_level")[heatmap_genes, ])
+
+RNA_mean <- rowMeans(assay(RNA,"TPM")[heatmap_genes, ])
+
+promoter_df <- data.frame(
+  gene = heatmap_genes,
+  oxoG = oxoG_mean,
+  TPM = RNA_mean)
+
+promoter_df <- na.omit(promoter_df)
+promoter_df$log_oxoG <- log10(promoter_df$oxoG + 1)
+promoter_df$log_TPM <- log10(promoter_df$TPM + 1)
+
+cor_res <- cor.test(promoter_df$log_oxoG, promoter_df$log_TPM, method = "spearman")
+
+cor_res
+
+p_corr <- ggplot(promoter_df,
+  aes(
+    x = log_oxoG,
+    y = log_TPM)) +
+  ggpointdensity::geom_pointdensity(size = 2) +
+  geom_smooth(
+    method = "lm",
+    color = "black",
+    linewidth = 1.2) +
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    hjust = 1.05,
+    vjust = 1.2,
+    size = 6,
+    label = paste0(
+      "Spearman rho = ",
+      round(cor_res$estimate, 3),
+      "\nP = ",
+      signif(cor_res$p.value, 3))) +
+  labs(
+    x = expression(log[10]~"(Promoter oxoG)"),
+    y = expression(log[10]~"(TPM)")) +
+  theme_classic(base_size = 22)
+p_corr
+ggsave("plots/Supplementary/Promoter_oxoG_vs_cycling_RNA_scatterplot.svg",p_corr,width = 7,height = 6)
+```
+
+## Suppl. Fig. 3D
+```{r}
+oxi_promoter <- readRDS("objects/hippocampus_oxoG_promoter_analysed.rds")
+se <- readRDS("objects/CRS2025_polyA_salmon.SE.analysed.rds")
+
+# Significant promoter oxoG AM vs PM genes
+
+tmp <- rowData(oxi_promoter)
+tmp_trans <- tmp[order(tmp$DEA.trans.Morning_vs_Evening$FDR),]
+
+sigGenes <- rownames(tmp_trans)[
+  !duplicated(tmp_trans$gene_symbol) & tmp_trans$DEA.trans.Morning_vs_Evening$FDR < 0.05]
+
+# Match IDs across datasets
+sigGenes_clean <- sub("\\..*","",sigGenes)
+oxo_ids <- sub("\\..*","", rownames(oxi_promoter))
+rna_ids <- sub("\\..*","",rownames(se))
+common_ids <- Reduce(intersect, list(sigGenes_clean, oxo_ids, rna_ids))
+oxo_idx <- match(common_ids, oxo_ids)
+rna_idx <- match(common_ids,rna_ids)
+oxo_rows <- rownames(oxi_promoter)[oxo_idx]
+rna_rows <- rownames(se)[rna_idx]
+
+# Cluster genes using RNA profiles
+
+rna_mat <- assay(se,"corrected")[rna_rows, ]
+keep <- rowSums(abs(rna_mat)) > 0
+rna_mat <- rna_mat[keep, ]
+rna_rows <- rna_rows[keep]
+oxo_rows <- oxo_rows[keep]
+ord <- hclust(as.dist(1 - cor(t(rna_mat), method = "pearson")),method = "average")$order
+
+rna_rows <- rna_rows[ord]
+oxo_rows <- oxo_rows[ord]
+
+# Order samples
+oxi_promoter$condition <- factor(oxi_promoter$condition,levels = c("Ctrl","CRS"))
+
+oxi_promoter$period <- factor(oxi_promoter$period, levels = c("morning","evening"))
+
+ord_oxo <- order(oxi_promoter$condition, oxi_promoter$period)
+
+oxi_promoter <- oxi_promoter[,ord_oxo]
+
+se$Condition <- factor(se$Condition,levels = c("Ctrl","CRS"))
+
+se$Period <- factor(se$Period,levels = c("morning","evening"))
+
+ord_rna <- order(se$Condition,se$Period)
+
+se <- se[,ord_rna]
+
+metadata(oxi_promoter)$anno_colors <- list(group = c(
+    "Ctrl_morning" = "#D1DEC8",
+    "Ctrl_evening" = "#7D9970",
+    "CRS_morning" = "#E3CDB8",
+    "CRS_evening" = "#BC7A5C"))
+
+metadata(se)$anno_colors <- list(Group = c(
+    "morning.Ctrl" = "#D1DEC8",
+    "evening.Ctrl" = "#7D9970",
+    "morning.CRS" = "#E3CDB8",
+    "evening.CRS" = "#BC7A5C"))
+
+hmcols <- c("#5D7290", "#FAF7F2", "#7A6A60")
+
+#Plot
+
+svg("plots/Supplementary/Promoter_oxoG_RNA_AMvsPM.svg",width = 7.5,height = 6)
+
+p <- draw(
+  sechm(
+    oxi_promoter,
+    oxo_rows,
+    assayName = "oxoG_trans_level",
+    do.scale = TRUE,
+    cluster_rows = FALSE,
+    hmcols = hmcols,
+    top_annotation = "group",
+    column_title =
+      "Promoter oxoG Transcribed Strand",
+    name = "oxoG level (scaled)") +
+  sechm(
+    se,
+    rna_rows,
+    assayName = "scaledLFC",
+    do.scale = FALSE,
+    cluster_rows = FALSE,
+    hmcols = hmcols,
+    top_annotation = "Group",
+    show_rownames = FALSE,
+    column_title = "RNA (scaledLFC)",
+    name = "scaledLFC"),
+  merge_legend = TRUE,
+  gap = unit(2, "mm"))
+p
+```
+
+## Suppl. Fig. 3E
+```{r}
+dinuc <- readRDS("objects/hippocampus_dinuc_summary.rds")
+dinuc_long <- dinuc  %>% pivot_longer(
+    cols = c(ApG, TpG, CpG, GpG),
+    names_to = "dinucleotide",
+    values_to = "oxoG_level")
+
+# Keep only control samples
+dinuc_summary_all <- dinuc_long %>%
+  dplyr::filter(
+    Treatment %in% c(
+      "Ctrl_morning",
+      "Ctrl_evening", "CRS_morning", "CRS_evening")) %>%
+  group_by(dinucleotide, Treatment) %>%
+  summarise(
+    mean = mean(oxoG_level, na.rm = TRUE),
+    sd   = sd(oxoG_level, na.rm = TRUE),
+    se   = sd / sqrt(n()), .groups = "drop")
+
+# Order dinucleotides
+dinuc_summary_all$dinucleotide <- factor(dinuc_summary_all$dinucleotide,
+  levels = c("ApG", "TpG", "CpG", "GpG"))
+
+# Plot
+p_dinuc_all <- ggplot(
+  dinuc_summary_all,
+  aes(
+    x = dinucleotide,
+    y = mean,
+    color = Treatment,
+    group = Treatment)) +
+  geom_linerange(
+    aes(
+      ymin = mean - se,
+      ymax = mean + se),
+    width = 0.05,
+    linewidth = 3) +
+  geom_line(linewidth = 2.5, color = "black") +
+  geom_point(size = 15) +
+  scale_color_manual(
+    values = c("Ctrl_morning" = "#D1DEC8", "Ctrl_evening" = "#7D9970", "CRS_morning" = "#E3CDB8", "CRS_evening" = "#BC7A5C")) +
+  labs(
+    x = "Dinucleotides with oxidized G at 2nd pos",
+    y = expression("Guanine oxidation (arbitrary unit)")) +
+  theme_classic(base_size = 18) +
+  theme(
+    axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x = element_text(size = 25,color = "black"),
+    axis.text.y = element_text(size = 25,color = "black"),
+    axis.line = element_line(linewidth = 1.8),
+    axis.ticks = element_line(linewidth = 1.8),
+    legend.position = "none") +
+scale_y_continuous(limits = c(1.0,2.0), breaks = seq(1.0,2.0, by = 0.5))
+p_dinuc_all
+ggsave("plots/Supplementary/hippocampus_dinuc_analysis_CRS.svg", p_dinuc_all, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+
+## Suppl. Fig. 3F
+```{r}
+meth_agg <- readRDS("objects/hipppocampus_oxoG_methylation.rds")
+df <- data.frame(
+  methyl_label = rowData(meth_agg)$methyl_label,
+  oxoG = rowData(meth_agg)$oxoG_counts)
+df_long <- df %>% pivot_longer(
+  cols = c(-methyl_label),
+  values_to = "oxoG",
+  names_to = "sample")
+df_long$sample <- sub("^oxoG\\.", "", df_long$sample)
+mean_across_sites <- df_long %>%
+    group_by(methyl_label, sample) %>%
+    summarise(
+      mean_val = mean(oxoG, na.rm = TRUE),.groups  = "drop")
+mean_across_sites$condition <- sub("^[0-9]+_", "", mean_across_sites$sample)
+
+mean_across_sites_crs <- mean_across_sites %>%
+  dplyr::filter(grepl("^CRS", condition))
+
+summary_df <- mean_across_sites_crs %>%
+  group_by(methyl_label) %>%
+  summarise(
+    mean_oxoG = mean(mean_val, na.rm = TRUE),
+    se_val = sd(mean_val, na.rm = TRUE) / sqrt(n()),.groups = "drop")
+
+summary_df$methyl_label <- factor(summary_df$methyl_label, levels = c("No", "Medium", "High"))
+mean_across_sites_crs$methyl_label <- factor(mean_across_sites_crs$methyl_label,
+  levels = c("No", "Medium", "High"))
+
+p_plot <- ggplot(
+  summary_df,
+  aes(
+    x = methyl_label,
+    y = mean_oxoG,
+    color = methyl_label )) +
+  geom_point(size = 15) +
+  geom_errorbar(
+    aes(
+      ymin = mean_oxoG - se_val,
+      ymax = mean_oxoG + se_val),
+    width = 0.35,
+    linewidth = 2.0) +
+  scale_color_manual(
+    values = c(
+      "No" = "#D9D9D9",
+      "Medium" = "#E3CDB8",
+      "High" = "#BC7A5C")) +
+  labs(
+    x = "CpG methylation level",
+    y = "Guanine oxidation level (arb. unit)",
+    color = "Methylation") +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x  = element_text(size = 25),
+    axis.text.y  = element_text(size = 25),
+    legend.title = element_text(size = 35),
+    legend.text  = element_text(size = 33),
+    axis.line = element_line(linewidth = 2),
+    axis.ticks = element_line(linewidth = 2),
+    axis.ticks.length = unit(0.35, "cm"))
+
+p_plot
+ggsave("plots/Supplementary/hippocampus_oxoG_methylation_CRS.svg", p_plot, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+## Suppl. Fig. 3G
+
+```{r}
+final_results_expressed <- readRDS("objects/hippocampus_oxoG_around_TSS_CRS_results.rds")
+summary_df_allgene_expressed <- final_results_expressed$summary
+
+brks <- seq(0, 200, by = 25)
+labs <- rep("", length(brks))
+sel <- brks %in% c(0, 100, 200)
+labs[sel] <- c("-20Kb", "TSS", "+20Kb")
+
+condition_sep <- summary_df_allgene_expressed %>%
+  group_by(group, counter, strand) %>%
+  summarise(
+    oxoG = mean(mean_val, na.rm = TRUE),
+    se = mean(se_val, na.rm = TRUE),.groups = "drop")
+
+p_combined <- ggplot(
+  condition_sep,
+  aes(
+    x = counter,
+    y = oxoG,
+    colour = group,
+    fill = group,
+    linetype = strand,
+    group = interaction(group, strand))) +
+    #geom_point(size = 2) +
+    geom_line(position = position_dodge(width = 0.2), linewidth = 2.0) +
+    geom_ribbon(aes(ymin = oxoG - se, ymax = oxoG + se), alpha = 0.1, color = NA,position = position_dodge(width = 0.2))+
+scale_color_manual(
+  values = c("CRS_morning" = "#E3CDB8","CRS_evening" = "#BC7A5C"),
+  name = "Group") +
+scale_fill_manual(
+  values = c("CRS_morning" = "#E3CDB8","CRS_evening" = "#BC7A5C"),
+  name = "Group") +
+scale_linetype_manual(
+  values = c(
+    "Transcribed" = "solid",
+    "Non-transcribed" = "22"),name = "Strand")  +
+  ylim(c(0.4,1.8))+
+  scale_x_continuous(
+    limits = c(0, 210),
+    breaks = brks,
+    labels = labs,
+    expand = c(0, 0)) +
+  annotate("text", x = 35, y = 0.45, label = "bins=200b", hjust = 0.5, size = 10) +
+  coord_cartesian(clip = "off")+
+    labs(x = "", y = "Guanine oxidation (arb. unit)", title = "Guanine oxidation around TSS")+
+   theme_classic()+theme(
+    axis.title.x  = element_text(size = 35, face = "bold"),
+    axis.title.y  = element_text(size = 35, face = "bold"),
+    title  = element_text(size =40),
+    axis.text.x   = element_text(size = 25),
+    axis.text.y   = element_text(size = 25),
+    axis.line     = element_line(size = 1.8),
+    axis.ticks    = element_line(size = 1.8),
+    axis.ticks.length = unit(0.35, "cm"),
+    legend.key.width = unit(2, "lines"),
+    legend.text = element_text(size = 20),
+    legend.position = c(0.95, 0.05),legend.justification = c("right", "bottom"))
+p_combined
+
+ggsave("plots/Supplementary/hippocampus_oxoG_around_TSS_CRS.svg", p_combined, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+## Suppl. Fig. 3H
+
+```{r}
+crs_expressed <- readRDS("objects/hippocampus_oxoG_gene_length_CRS.rds")
+p_crs_allexpressed <- ggplot(
+  crs_expressed,
+  aes(
+    x = counter,
+    y = oxoG,
+    color = strand,
+    fill = strand,
+    group = interaction(strand, gene_length_label))) +
+  geom_line(
+    aes(linetype = gene_length_label),
+    linewidth = 2.2,
+    position = position_dodge(width = 0.2)) +
+  geom_ribbon(
+    aes(
+      ymin = oxoG - se_val,
+      ymax = oxoG + se_val),
+    alpha = 0.15,
+    color = NA,
+    position = position_dodge(width = 0.2)) +
+  scale_linetype_manual(
+    name = "Gene length",
+    values = c(
+      "<9Kb"   = "solid",
+      "<23Kb"  = "dashed",
+      "<60Kb"  = "dotted",
+      ">=60Kb" = "dotdash")) +
+  scale_color_manual(
+    values = c(
+      "Transcribed" = "#BC7A5C",
+      "Non-transcribed" = "#7F7F7F")) +
+  scale_fill_manual(
+    values = c(
+      "Transcribed" = "#BC7A5C",
+      "Non-transcribed" = "#7F7F7F")) +
+  scale_x_continuous(
+    breaks = c(1, 25, 50, 75, 100),
+    labels = c("-5Kb", "TSS", "50% gene", "TES", "+5Kb")) +
+  annotate("text",x = 13, y = -0.08,label = "upstream",size = 10) +
+  annotate("text",x = 13, y = -0.17,label = "bins = 200 bp", size = 10) +
+  annotate("text",x = 50, y = -0.12,label = "gene body\n(2% bins)",size = 10) +
+  annotate("text",x = 88, y = -0.08,label = "downstream",size = 10) +
+  annotate("text",x = 88, y = -0.17,label = "bins = 200 bp",size = 10) +
+  labs(
+    x = "",
+    y = "Guanine oxidation (arb. unit)",
+    title = "Guanine oxidation by gene length") +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(size = 35, face = "bold"),
+    axis.title.y = element_text(size = 35, face = "bold"),
+    axis.text.x  = element_text(size = 25),
+    axis.text.y  = element_text(size = 25),
+    plot.title = element_text(size = 40),
+    plot.subtitle = element_text(size = 35),
+    legend.title = element_text(size = 25),
+    legend.text = element_text(size = 20),
+    legend.key.width = unit(3, "lines"),
+    axis.line = element_line(linewidth = 1.8),
+    axis.ticks = element_line(linewidth = 1.8),
+    axis.ticks.length = unit(0.35, "cm"))
+p_crs_allexpressed
+ggsave("plots/Supplementary/hippocampus_oxoG_gene_length_CRS.svg", p_crs_allexpressed, width = 14, height = 10, dpi = 600, units = "in")
+```
+
+
+## Suppl. Fig. 3I
+```{r}
+promoter_bsseq_filtered <- readRDS("objects/promoter_RRBS.rds")
+meth <- assay(promoter_bsseq_filtered, "M") /
+        assay(promoter_bsseq_filtered, "Cov")
+meth[is.infinite(meth)] <- NA
+meth <- meth[complete.cases(meth), ]
+vars <- apply(meth, 1, var)
+top_n <- 500
+top_promoters <- names(sort(vars, decreasing = TRUE))[1:top_n]
+
+se_heat <- SummarizedExperiment(
+  assays = list(methylation = meth[top_promoters, ]),
+  colData = colData(promoter_bsseq_filtered))
+
+se_heat$Group <- paste(
+  se_heat$Time,
+  se_heat$Treatment,
+  sep = ".")
+
+metadata(se_heat)$anno_colors <- list(
+  Group = c(
+    "Morning.Ctrl" = "#D1DEC8",
+    "Evening.Ctrl" = "#7D9970",
+    "Morning.CRS"  = "#E3CDB8",
+    "Evening.CRS"  = "#BC7A5C"))
+
+hmcols <- colorRampPalette(c("#5D7290","#FAF7F2","#7A6A60"))(101)
+
+setSechmOption("hmcols", value = hmcols)
+
+colData(se_heat)$Treatment <- factor(colData(se_heat)$Treatment, levels = c("Ctrl", "CRS"))
+
+colData(se_heat)$Time <- factor(colData(se_heat)$Time,levels = c("Morning", "Evening"))
+
+hm <- sechm(
+  se_heat,
+  assayName = "methylation",
+  features = rownames(se_heat),
+  do.scale = TRUE,
+  gaps_at = c("Treatment"),
+  top_annotation = "Group",
+  show_rownames = FALSE,
+  name = "Promoter methylation",
+  column_order =
+    colnames(se_heat)[
+      order(
+        colData(se_heat)$Treatment,
+        colData(se_heat)$Time)])
+svg("plots/Supplementary/promoter_methylation_heatmap.svg",width = 8,height = 10)
+
+draw(hm)
+dev.off()
+```
+
+## Suppl. Fig. 3J
+```{r}
+genebody_bsseq_filtered <- readRDS("objects/genebody_RRBS.rds")
+meth <- assay(genebody_bsseq_filtered, "M") /
+        assay(genebody_bsseq_filtered, "Cov")
+meth[is.infinite(meth)] <- NA
+meth <- meth[complete.cases(meth), ]
+vars <- apply(meth, 1, var)
+top_n <- 500
+top_genebody <- names(sort(vars, decreasing = TRUE))[1:top_n]
+
+se_heat <- SummarizedExperiment(
+  assays = list(methylation = meth[top_genebody, ]),
+  colData = colData(genebody_bsseq_filtered))
+
+se_heat$Group <- paste(
+  se_heat$Time,
+  se_heat$Treatment,
+  sep = ".")
+
+metadata(se_heat)$anno_colors <- list(
+  Group = c(
+    "Morning.Ctrl" = "#D1DEC8",
+    "Evening.Ctrl" = "#7D9970",
+    "Morning.CRS"  = "#E3CDB8",
+    "Evening.CRS"  = "#BC7A5C"))
+
+hmcols <- colorRampPalette(c("#5D7290","#FAF7F2","#7A6A60"))(101)
+
+setSechmOption("hmcols", value = hmcols)
+
+colData(se_heat)$Treatment <- factor(colData(se_heat)$Treatment,
+  levels = c("Ctrl", "CRS"))
+
+colData(se_heat)$Time <- factor(colData(se_heat)$Time,
+  levels = c("Morning", "Evening"))
+
+hm <- sechm(
+  se_heat,
+  assayName = "methylation",
+  features = rownames(se_heat),
+  do.scale = TRUE,
+  gaps_at = c("Treatment"),
+  top_annotation = "Group",
+  show_rownames = FALSE,
+  name = "Genebody methylation",
+  column_order =
+    colnames(se_heat)[
+      order(
+        colData(se_heat)$Treatment,
+        colData(se_heat)$Time)])
+svg("plots/Supplementary/genebody_methylation_heatmap.svg",width = 8, height = 10)
+draw(hm)
+dev.off()
+```
+
+
+
+# Functions
+
+## 2D Embedding
+```{r}
+plot2D<- function(us, reports = NULL, transitionmatrices = NULL, transitionmatrices_stabilized = NULL, normalize = TRUE, method = "umap", colorby = NULL, colors = NULL, plot.density = FALSE, plot.sem = FALSE, seed = 123, ...){
+  require(M3C)
+  require(imputeTS)
+  if(is.null(reports) & is.null(transitionmatrices) & is.null(transitionmatrices_stabilized)){
+    print("neiter reports nor transitionmatrices specified. using all data for 2D embedding")
+    if(us$has.updated.analysis$Report){
+      reports <- names(us$Report)
+    }
+    if(us$has.updated.analysis$Transmat){
+      transitionmatrices <- us$transitionmatrix_names
+    }
+  }
+  
+  #checks if data indicated to be added to the embedding data actually exists, otherwise a warning for each dicrepancy will be produced and the function returns NULL
+  check <- FALSE
+  if(sum(!reports %in% names(us$Report))){
+    warning("selected report(s) for embedding that is not present in US_data:\n", paste(reports[!reports %in% names(us$Report)]))
+    check <- TRUE
+  }
+  if(sum(!transitionmatrices %in% us$transitionmatrix_names)){
+    warning("selected transitionmatrix for embedding that is not present in US_data:\n", paste(transitionmatrices[!transitionmatrices %in% us$transitionmatrix_names]))
+    check <- TRUE
+  }
+  for(i in us$file_names){
+    if(sum(!transitionmatrices_stabilized %in% names(us$files[[i]]$transmatrix_stabilized))){
+      warning(paste("selected stabilized transitionmatrix embedding that is not present in US_data of file:", i), "\n",
+              paste(transitionmatrices_stabilized[!transitionmatrices_stabilized %in% names(us$files[[i]]$transmatrix_stabilized)], collapse = "\n"))
+      check <- TRUE
+    }
+  }
+  if(check){
+    return(NULL)
+  }
+
+  # Build up data to be used for 2D Embedding by flattening all selected reports, transitionmatrices and normalized transitionmatices and building up a matrix with samples as rows and features as columns
+  mat <- data.frame()
+  if(!is.null(reports)){
+    print(paste("including report:", reports, sep = " "))
+    for(r in reports){
+      mat <- rbind(mat,t(us$Report[[r]]))
+    }
+  }
+  if(!is.null(transitionmatrices)){
+    print(paste("including transitionmatrix:", transitionmatrices, sep = " "))
+    tmat <- list()
+    for(i in names(us$files)){
+      rdat <- NULL
+      for(r in transitionmatrices){
+        rdat <- append(rdat,c(us$files[[i]]$transmatrix[[r]]))
+      }
+      tmat[[i]] <- rdat
+    }
+    tmat <- do.call(cbind,tmat)
+    mat <- rbind(mat,tmat)
+  }
+  if(!is.null(transitionmatrices_stabilized)){
+    print(paste("including stabilized transitionmatrix:", transitionmatrices_stabilized, sep = " "))
+    tmat <- list()
+    for(i in names(us$files)){
+      rdat <- NULL
+      for(r in transitionmatrices_stabilized){
+        rdat <- append(rdat,c(us$files[[i]]$transmatrix_stabilized[[r]]))
+      }
+      tmat[[i]] <- rdat
+    }
+    tmat <- do.call(cbind,tmat)
+    mat <- rbind(mat,tmat)
+  }
+  
+  # fill NA and Normalize data
+  mat <- as.matrix(imputeTS::na_replace(mat,fill = 0))
+  if(normalize){
+    mat <- t(apply(mat,MARGIN = 1, FUN = function(x){if(sum(x) > 0){(x - mean(x)) / (sd(x))}else{x}})) 
+  }
+  
+  # Embedding
+  if(method == "umap"){
+    res <- M3C::umap(mat, seed = seed, ...)
+  }else if(method == "tsne"){
+    res <- M3C::tsne(mat, seed = seed, ...)
+  }
+  
+  # Build up final plot
+  if(!is.null(colorby)){
+    res$data <- cbind(res$data,col = us$meta[,colorby])
+    res$data$sz <- 1
+    res$data$sz[is.na(res$data$col)] <- 0
+    p1 <- ggplot(data.frame(res$data),aes(X1,X2, color = col)) + 
+      geom_point(size = (4),alpha = (3.5 + 3.5*res$data$sz)) 
+    if(plot.density){
+      p1 <- p1 + geom_density2d()
+    }
+    if(plot.sem){
+      aggdat <- aggregate(res$data[,1:2], FUN = mean, by = list(res$data$col))
+      aggdat_sem <- aggregate(res$data[,1:2], FUN = function(x){sd(x) / sqrt(length(x))}, by = list(res$data$col))
+      aggdat <- cbind(aggdat,X1.sem = aggdat_sem$X1,X2.sem = aggdat_sem$X2)
+      
+      semdim <- mean(c(aggdat_sem$X1, aggdat_sem$X2))
+      p1 <- p1 + geom_errorbar(data = aggdat,aes(ymin = X2 - X2.sem,ymax =  X2 + X2.sem, col = Group.1), width = semdim) + 
+        geom_errorbarh(data = aggdat,aes(xmin = X1 - X1.sem,xmax = X1 + X1.sem, col = Group.1), height = semdim)
+    }
+    if(!is.null(colors)){
+      p1 <- p1 + scale_color_manual(values = colors)
+    }
+  }else{
+    p1 <- ggplot(data.frame(res$data),aes(X1,X2)) +
+      geom_point()
+  }
+
+  p1 <- p1 +
+    theme_classic(base_size = 25) +
+    theme(
+      axis.title = element_text(size = 28, face = "bold"),
+      axis.text = element_text(size = 25)
+    )
+
+  return(p1)
+}
+```
+
+## Histogram Transition Stats
+```{r}
+PlotTransitionsStats <- function(
+    us,
+    analysis = NULL,
+    labels = NULL,
+    title = NULL
+){
+  require(ggplot2)
+  require(cowplot)
+  if(is.null(analysis)){
+    analysis <- names(us$Results)
+  }
+  if(is.null(labels)){
+    for(i in analysis){
+      labels <- unique(
+        c(labels, names(us$Results[[i]]$TransitionStats)
+        )
+      )
+    }
+  }
+
+  ps <- list()
+
+  for(i in analysis){
+
+    for(j in labels[
+      labels %in%
+      names(us$Results[[i]]$TransitionStats)
+    ]){
+
+      bdat <- data.frame(
+        distance =
+          us$Results[[i]]$TransitionStats[[j]]$bootstraps
+      )
+
+      dis <- us$Results[[i]]$TransitionStats[[j]]$distance
+      sigma <- us$Results[[i]]$TransitionStats[[j]]$sigma
+      percentile <- us$Results[[i]]$TransitionStats[[j]]$percentile
+
+      p1 <- ggplot(
+        bdat,
+        aes(distance)
+      ) +
+
+        geom_histogram(
+          color = "black",
+          fill = "lightgrey",
+          bins = 30,
+          linewidth = 0.8
+        ) +
+
+        geom_vline(
+          xintercept = dis,
+          color = "brown",
+          linewidth = 3.2
+        ) +
+
+        ylab("Frequency") +
+        xlab("Manhattan Distance") +
+        ggtitle(title) +
+
+        annotate(
+          "label",
+          x = Inf,
+          y = Inf,
+          label = paste0(
+            "percentile: ",
+            signif(percentile, 4),
+            "\n",
+            "sigma: ",
+            round(sigma, 2),
+            "\n",
+            "p.value: ",
+            signif(
+              (
+                1 -
+                pracma::erf(
+                  sigma / sqrt(2)
+                )
+              ) / 2,
+              3
+            )
+          ),
+          hjust = 1.05,
+          vjust = 1.1,
+          size = 6,
+          label.size = 0.8,
+          fill = "white",
+          color = "black",
+          family = "Helvetica",
+          lineheight = 1.1
+        ) +
+
+        theme_classic(
+          base_size = 20
+        ) +
+
+        theme(
+          plot.title =
+            element_text(
+              size = 26,
+              face = "bold"
+            ),
+          axis.title =
+            element_text(
+              size = 28,
+              face = "bold"
+            ),
+          axis.text =
+            element_text(
+              size = 25
+            ),
+          axis.line =
+            element_line(
+              linewidth = 1.5
+            ),
+          axis.ticks =
+            element_line(
+              linewidth = 1
+            )
+        )
+
+      ps[[paste(i, j, sep = "-")]] <-
+        cowplot::plot_grid(
+          p1,
+          nrow = 1,
+          rel_widths = c(1)
+        )
+    }
+  }
+
+  cowplot::plot_grid(
+    plotlist = ps,
+    ncol = 1
+  )
+}
+```
+
+
+
+```{r}
+library(sechm)
+library(ComplexHeatmap)
+
+## Load data
+oxi_genebody <- readRDS("objects/hippocampus_oxoG_genebody_analysed.rds")
+oxi_genebody <- oxi_genebody[, order(oxi_genebody$group)]
+
+## Colors
+J_palette <- c(
+  "Ctrl_morning" = "#D1DEC8",
+  "Ctrl_evening" = "#7D9970",
+  "CRS_morning"  = "#E3CDB8",
+  "CRS_evening"  = "#BC7A5C"
+)
+
+metadata(oxi_genebody)$anno_colors <- list(group = J_palette)
+
+## Create heatmap object
+oxi_genebody_for_heatmap <- oxi_genebody
+
+## Remove Ensembl version numbers
+rownames(oxi_genebody_for_heatmap) <-
+  sub("\\..*", "", rownames(oxi_genebody_for_heatmap))
+
+## ENSG -> gene symbol mapping
+gene_labels <- rowData(oxi_genebody_for_heatmap)$gene_symbol
+names(gene_labels) <- rownames(oxi_genebody_for_heatmap)
+
+## Replace rownames with gene symbols
+new_names <- gene_labels
+new_names[is.na(new_names) | new_names == ""] <-
+  rownames(oxi_genebody_for_heatmap)[is.na(new_names) | new_names == ""]
+
+rownames(oxi_genebody_for_heatmap) <- make.unique(new_names)
+
+## Sample names
+colnames(oxi_genebody_for_heatmap) <-
+  as.character(oxi_genebody_for_heatmap$group)
+
+## Select all significant Morning vs Evening genes
+features_trans_AMvsPM_symbols <-
+  unique(
+    rowData(oxi_genebody)$gene_symbol[
+      rowData(oxi_genebody)$FDR_trans < 0.05
+    ]
+  )
+
+features_trans_AMvsPM_symbols <-
+  features_trans_AMvsPM_symbols[
+    !is.na(features_trans_AMvsPM_symbols) &
+      features_trans_AMvsPM_symbols != ""
+  ]
+
+## Heatmap colors
+hmcols <- c("#5D7290", "#FAF7F2", "#7A6A60")
+
+ht_opt(simple_anno_size = unit(20, "mm"))
+
+
+draw(
+  sechm(
+    oxi_genebody_for_heatmap,
+    features_trans_AMvsPM_symbols,
+    show_rownames = FALSE,
+    assayName = "oxoG_trans_level",
+    hmcols = hmcols,
+    do.scale = TRUE,
+    top_annotation = "group",
+    column_title = "Genebody oxoG Transcribed Strand (AM vs PM)",
+    name = "oxoG level (scaled)"
+  )
+)
+
+dev.off()
+
+ht_opt(simple_anno_size = unit(5, "mm"))
+```
+
